@@ -2041,6 +2041,188 @@ class SQLiteExecutionContext(default.DefaultExecutionContext):
             return colname, None
 
 
+def _sqlite_ddl_tokens(sql):
+    """Tokenize SQLite DDL.
+
+    Yields ``(kind, text, start, end)`` tuples where ``start``/``end`` are
+    offsets into the original string.  Whitespace and both line (``--``)
+    and block (``/* */``) comments are skipped.  String literals and
+    quoted identifiers (double-quoted, backtick-quoted, or
+    bracket-quoted) are returned as single tokens so that their contents
+    are never mistaken for keywords or punctuation.
+
+    """
+
+    i = 0
+    n = len(sql)
+    while i < n:
+        char = sql[i]
+        if char.isspace():
+            i += 1
+            continue
+        if char == "-" and sql[i : i + 2] == "--":
+            newline = sql.find("\n", i + 2)
+            i = n if newline == -1 else newline + 1
+            continue
+        if char == "/" and sql[i : i + 2] == "/*":
+            close = sql.find("*/", i + 2)
+            i = n if close == -1 else close + 2
+            continue
+        if char in "'\"`":
+            quote = char
+            j = i + 1
+            while j < n:
+                if sql[j] == quote:
+                    if sql[j + 1 : j + 2] == quote:
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            yield ("string" if quote == "'" else "qident", sql[i:j], i, j)
+            i = j
+            continue
+        if char == "[":
+            close = sql.find("]", i + 1)
+            j = n if close == -1 else close + 1
+            yield ("qident", sql[i:j], i, j)
+            i = j
+            continue
+        if char == "(":
+            yield ("lparen", char, i, i + 1)
+            i += 1
+            continue
+        if char == ")":
+            yield ("rparen", char, i, i + 1)
+            i += 1
+            continue
+        if char == ",":
+            yield ("comma", char, i, i + 1)
+            i += 1
+            continue
+        j = i + 1
+        while j < n and not sql[j].isspace() and sql[j] not in "()'\",`[]":
+            if sql[j : j + 2] in ("--", "/*"):
+                break
+            j += 1
+        yield ("word", sql[i:j], i, j)
+        i = j
+
+
+def _sqlite_unquote_identifier(token):
+    if len(token) >= 2:
+        if token[0] == '"' and token[-1] == '"':
+            return token[1:-1].replace('""', '"')
+        elif token[0] == "`" and token[-1] == "`":
+            return token[1:-1].replace("``", "`")
+        elif token[0] == "[" and token[-1] == "]":
+            return token[1:-1]
+    return token
+
+
+def _sqlite_parse_check_constraints(sql):
+    """Parse CHECK constraints from SQLite CREATE TABLE DDL.
+
+    Returns a list of dicts with ``name`` and ``sqltext`` keys.  The
+    ``sqltext`` is the exact substring of the original DDL between the
+    parentheses that follow the CHECK keyword, so it remains valid,
+    recompilable SQL including any whitespace and comments.
+
+    """
+
+    tokens = list(_sqlite_ddl_tokens(sql))
+
+    # locate the outermost parenthesized column/constraint definition list
+    def_list_start = None
+    for idx, token in enumerate(tokens):
+        if token[0] == "lparen":
+            def_list_start = idx
+            break
+    if def_list_start is None:
+        return []
+
+    # split the definition list into parts at top-level commas
+    parts = []
+    part_start = def_list_start + 1
+    depth = 1
+    idx = def_list_start + 1
+    while idx < len(tokens):
+        kind = tokens[idx][0]
+        if kind == "lparen":
+            depth += 1
+        elif kind == "rparen":
+            depth -= 1
+            if depth == 0:
+                parts.append((part_start, idx))
+                break
+        elif kind == "comma" and depth == 1:
+            parts.append((part_start, idx))
+            part_start = idx + 1
+        idx += 1
+
+    checks = []
+    for part_start, part_end in parts:
+        checks.extend(
+            _sqlite_checks_in_def_part(tokens, part_start, part_end, sql)
+        )
+    return checks
+
+
+def _sqlite_checks_in_def_part(tokens, part_start, part_end, sql):
+    """Extract CHECK constraints from a single column or table
+    constraint definition."""
+
+    results = []
+    depth = 0
+    idx = part_start
+    while idx < part_end:
+        kind, text, _, _ = tokens[idx]
+        if kind == "lparen":
+            depth += 1
+        elif kind == "rparen":
+            depth -= 1
+        elif kind == "word" and depth == 0 and text.upper() == "CHECK":
+            # the CHECK keyword must be directly followed by a
+            # parenthesized expression
+            lparen_idx = idx + 1
+            if lparen_idx < part_end and tokens[lparen_idx][0] == "lparen":
+                paren_depth = 0
+                rparen_idx = lparen_idx
+                while rparen_idx < part_end:
+                    rkind = tokens[rparen_idx][0]
+                    if rkind == "lparen":
+                        paren_depth += 1
+                    elif rkind == "rparen":
+                        paren_depth -= 1
+                        if paren_depth == 0:
+                            break
+                    rparen_idx += 1
+                if rparen_idx >= part_end:
+                    # unbalanced parentheses; not valid DDL
+                    break
+
+                # a named constraint is "CONSTRAINT <name> CHECK ..."
+                name = None
+                if idx - 2 >= part_start:
+                    name_token = tokens[idx - 1]
+                    constraint_token = tokens[idx - 2]
+                    if (
+                        constraint_token[0] == "word"
+                        and constraint_token[1].upper() == "CONSTRAINT"
+                        and name_token[0] in ("word", "qident")
+                    ):
+                        name = _sqlite_unquote_identifier(name_token[1])
+
+                sqltext = sql[
+                    tokens[lparen_idx][3] : tokens[rparen_idx][2]
+                ].strip()
+                results.append({"name": name, "sqltext": sqltext})
+                idx = rparen_idx + 1
+                continue
+        idx += 1
+    return results
+
+
 class SQLiteDialect(default.DefaultDialect):
     name = "sqlite"
     supports_alter = False
@@ -2771,27 +2953,11 @@ class SQLiteDialect(default.DefaultDialect):
             connection, table_name, schema=schema, **kw
         )
 
-        # NOTE NOTE NOTE
-        # DO NOT CHANGE THIS REGULAR EXPRESSION.   There is no known way
-        # to parse CHECK constraints that contain newlines themselves using
-        # regular expressions, and the approach here relies upon each
-        # individual
-        # CHECK constraint being on a single line by itself.   This
-        # necessarily makes assumptions as to how the CREATE TABLE
-        # was emitted.   A more comprehensive DDL parsing solution would be
-        # needed to improve upon the current situation. See #11840 for
-        # background
-        CHECK_PATTERN = r"(?:CONSTRAINT (.+) +)?CHECK *\( *(.+) *\),? *"
-        cks = []
-
-        for match in re.finditer(CHECK_PATTERN, table_data or "", re.I):
-
-            name = match.group(1)
-
-            if name:
-                name = re.sub(r'^"|"$', "", name)
-
-            cks.append({"sqltext": match.group(2), "name": name})
+        # tokenize and parse the CREATE TABLE DDL so that CHECK
+        # constraints may span multiple lines, share a single line, and
+        # contain arbitrary SQL expressions including strings, quoted
+        # identifiers, and comments.  See #11840 for background
+        cks = _sqlite_parse_check_constraints(table_data or "")
         cks.sort(key=lambda d: d["name"] or "~")  # sort None as last
         if cks:
             return cks

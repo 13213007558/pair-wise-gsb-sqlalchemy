@@ -2576,7 +2576,6 @@ class ConstraintReflectionTest(fixtures.TestBase):
             ],
         )
 
-    @testing.fails("need to come up with new regex and/or DDL parsing")
     def test_check_constraint_multiline(self):
         """test for #11677"""
 
@@ -2660,6 +2659,204 @@ class ConstraintReflectionTest(fixtures.TestBase):
             eq_(const["column_names"], [expected])
         else:
             assert False
+
+
+class CheckConstraintParsingReflectionTest(fixtures.TestBase):
+    """Test reflection of CHECK constraints from arbitrarily formatted
+    DDL: multiline constraints, several constraints on one line,
+    column-level and table-level constraints, nested parentheses,
+    strings, quoted identifiers and comments."""
+
+    __only_on__ = "sqlite"
+    __backend__ = True
+
+    tricky_ddl = (
+        "CREATE TABLE tricky_ck (\n"
+        "    id INTEGER NOT NULL,\n"
+        '    "val,ue" INTEGER CONSTRAINT "ck ""quoted"" name" CHECK (\n'
+        '        ("val,ue" > 0 AND ("val,ue" < 100))\n'
+        "    ),\n"
+        "    [note] TEXT CHECK ([note] <> 'bad, (CHECK) /*x*/'),\n"
+        "    qty INTEGER CHECK (qty >= 0) "
+        "CONSTRAINT ck_qty_max CHECK (qty <= 1000),\n"
+        "    amount REAL, -- a comment with CHECK (fake > 0)\n"
+        "    /* block comment CONSTRAINT nope CHECK (fake2)\n"
+        "       spanning lines, with (parens) and 'strings' */\n"
+        "    CONSTRAINT ck_amount "
+        "CHECK (amount >= 0 AND amount <= 1000000), "
+        "CHECK ([note] NOT GLOB '*--*'),\n"
+        "    CHECK (id > 0),\n"
+        "    PRIMARY KEY (id)\n"
+        ")"
+    )
+
+    expected_checks = [
+        {
+            "name": 'ck "quoted" name',
+            "sqltext": '("val,ue" > 0 AND ("val,ue" < 100))',
+        },
+        {
+            "name": "ck_amount",
+            "sqltext": "amount >= 0 AND amount <= 1000000",
+        },
+        {"name": "ck_qty_max", "sqltext": "qty <= 1000"},
+        {"name": None, "sqltext": "[note] <> 'bad, (CHECK) /*x*/'"},
+        {"name": None, "sqltext": "qty >= 0"},
+        {"name": None, "sqltext": "[note] NOT GLOB '*--*'"},
+        {"name": None, "sqltext": "id > 0"},
+    ]
+
+    @testing.fixture
+    def tricky_table(self, connection):
+        connection.exec_driver_sql(self.tricky_ddl)
+        try:
+            yield
+        finally:
+            connection.exec_driver_sql("DROP TABLE tricky_ck")
+
+    @staticmethod
+    def _sort_key(entry):
+        return (entry[0] is None, entry[0] or "", entry[1])
+
+    def _table_checks(self, table):
+        return sorted(
+            (
+                (constraint.name, str(constraint.sqltext))
+                for constraint in table.constraints
+                if isinstance(constraint, CheckConstraint)
+            ),
+            key=self._sort_key,
+        )
+
+    def _expected_sorted(self):
+        return sorted(
+            ((ck["name"], ck["sqltext"]) for ck in self.expected_checks),
+            key=self._sort_key,
+        )
+
+    def test_get_check_constraints(self, connection, tricky_table):
+        insp = inspect(connection)
+        eq_(insp.get_check_constraints("tricky_ck"), self.expected_checks)
+
+    def test_reflection_paths_consistent(self, connection, tricky_table):
+        insp = inspect(connection)
+        via_inspector = sorted(
+            (
+                (ck["name"], ck["sqltext"])
+                for ck in insp.get_check_constraints("tricky_ck")
+            ),
+            key=self._sort_key,
+        )
+
+        table = Table("tricky_ck", MetaData(), autoload_with=connection)
+        via_autoload = self._table_checks(table)
+
+        metadata = MetaData()
+        metadata.reflect(connection)
+        via_reflect = self._table_checks(metadata.tables["tricky_ck"])
+
+        expected = self._expected_sorted()
+        eq_(via_inspector, expected)
+        eq_(via_autoload, expected)
+        eq_(via_reflect, expected)
+
+    def test_roundtrip_insert_behavior(self, connection, tricky_table):
+        """Reflect the table, compile it into a brand new database, and
+        verify the same valid/invalid INSERTs are accepted/rejected."""
+
+        metadata = MetaData()
+        reflected = Table("tricky_ck", metadata, autoload_with=connection)
+
+        new_engine = create_engine("sqlite://")
+        try:
+            with new_engine.begin() as new_conn:
+                metadata.create_all(new_conn)
+
+                def row(id_, value, note, qty, amount):
+                    return {
+                        "id": id_,
+                        "val,ue": value,
+                        "note": note,
+                        "qty": qty,
+                        "amount": amount,
+                    }
+
+                valid_rows = [
+                    row(1, 50, "ok", 0, 0.5),
+                    row(2, 1, "a, b (c) CHECK (d)", 1000, 0),
+                    row(3, 99, None, 500, 1000000),
+                ]
+                invalid_rows = [
+                    row(-1, 50, "ok", 0, 0.5),
+                    row(4, 0, "ok", 0, 0.5),
+                    row(5, 100, "ok", 0, 0.5),
+                    row(6, 50, "bad, (CHECK) /*x*/", 0, 0.5),
+                    row(7, 50, "x--y", 0, 0.5),
+                    row(8, 50, "ok", -1, 0.5),
+                    row(9, 50, "ok", 1001, 0.5),
+                    row(10, 50, "ok", 0, -1),
+                    row(11, 50, "ok", 0, 1000001),
+                ]
+
+                def accepted(conn, data):
+                    try:
+                        conn.execute(reflected.insert(), data)
+                    except exc.IntegrityError:
+                        return False
+                    else:
+                        return True
+
+                for data in valid_rows + invalid_rows:
+                    original = accepted(connection, data)
+                    roundtripped = accepted(new_conn, data)
+                    eq_(
+                        roundtripped,
+                        original,
+                        "mismatched outcome for row %r" % (data,),
+                    )
+                    eq_(original, data in valid_rows, "row %r" % (data,))
+        finally:
+            new_engine.dispose()
+
+    def test_attached_schema(self, connection):
+        connection.exec_driver_sql("ATTACH ':memory:' AS aux")
+        try:
+            connection.exec_driver_sql(
+                self.tricky_ddl.replace(
+                    "CREATE TABLE tricky_ck", "CREATE TABLE aux.tricky_ck"
+                )
+            )
+            insp = inspect(connection)
+            eq_(
+                insp.get_check_constraints("tricky_ck", schema="aux"),
+                self.expected_checks,
+            )
+
+            table = Table(
+                "tricky_ck", MetaData(), autoload_with=connection, schema="aux"
+            )
+            eq_(self._table_checks(table), self._expected_sorted())
+        finally:
+            connection.exec_driver_sql("DROP TABLE IF EXISTS aux.tricky_ck")
+            connection.exec_driver_sql("DETACH aux")
+
+    def test_nonexistent_table(self, connection):
+        insp = inspect(connection)
+        assert_raises(
+            exc.NoSuchTableError,
+            insp.get_check_constraints,
+            "definitely_not_a_table",
+        )
+
+    def test_no_check_constraints(self, connection):
+        connection.exec_driver_sql(
+            "CREATE TABLE no_ck (id INTEGER, data VARCHAR(10))"
+        )
+        try:
+            insp = inspect(connection)
+            eq_(insp.get_check_constraints("no_ck"), [])
+        finally:
+            connection.exec_driver_sql("DROP TABLE no_ck")
 
 
 class SavepointTest(fixtures.TablesTest):
