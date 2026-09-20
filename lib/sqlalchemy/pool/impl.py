@@ -9,11 +9,15 @@
 """Pool implementation classes."""
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 import threading
 import traceback
 import typing
+from time import time as _time
 from typing import Any
 from typing import cast
+from typing import Deque
 from typing import List
 from typing import Optional
 from typing import Set
@@ -38,6 +42,147 @@ from ..util.typing import Literal
 
 if typing.TYPE_CHECKING:
     from ..engine.interfaces import DBAPIConnection
+
+
+class _StrictFifoWaiter:
+    __slots__ = ("event", "result", "admitted", "done")
+
+    def __init__(self, is_asyncio: bool):
+        self.event = asyncio.Event() if is_asyncio else threading.Event()
+        self.result: Optional[ConnectionPoolEntry] = None
+        self.admitted = False
+        self.done = False
+
+
+class _StrictFifoGate:
+    """Admission gate for checkouts that already found the pool saturated."""
+
+    def __init__(self, pool: "QueuePool"):
+        self._pool = pool
+        self._lock = threading.Lock()
+        self._waiters: Deque[_StrictFifoWaiter] = deque()
+
+    def waiting(self) -> bool:
+        with self._lock:
+            return any(not waiter.done for waiter in self._waiters)
+
+    def acquire(
+        self, timeout: Optional[float]
+    ) -> Optional[ConnectionPoolEntry]:
+        waiter = _StrictFifoWaiter(self._pool._is_asyncio)
+        endtime = None
+
+        with self._lock:
+            self._waiters.append(waiter)
+
+        try:
+            while True:
+                if timeout is not None:
+                    if endtime is None:
+                        endtime = _time() + timeout
+                    remaining = endtime - _time()
+                    if remaining <= 0.0:
+                        raise sqla_queue.Empty
+                else:
+                    remaining = None
+
+                if self._pool._is_asyncio:
+                    self._await_async(waiter, remaining)
+                else:
+                    if not waiter.event.wait(remaining):
+                        raise sqla_queue.Empty
+
+                with self._lock:
+                    if waiter.result is not None:
+                        result = waiter.result
+                        waiter.done = True
+                        return result
+                    if waiter.admitted:
+                        waiter.done = True
+                        return None
+        except BaseException:
+            with self._lock:
+                waiter.done = True
+                if waiter.result is not None:
+                    self._return_record(waiter.result)
+                elif waiter.admitted:
+                    self._signal_next()
+                self._prune_done()
+            raise
+
+    def _prune_done(self) -> None:
+        while self._waiters and self._waiters[0].done:
+            self._waiters.popleft()
+
+    def _await_async(
+        self, waiter: _StrictFifoWaiter, timeout: Optional[float]
+    ) -> None:
+        future = asyncio.ensure_future(waiter.event.wait())
+        if timeout is None:
+            self._pool._queue_class.await_(self._wait_for_future(future))
+            return
+
+        timeout_future = asyncio.ensure_future(asyncio.sleep(timeout))
+        try:
+            done, pending = self._pool._queue_class.await_(
+                asyncio.wait(
+                    {future, timeout_future},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            )
+        finally:
+            if not future.done():
+                future.cancel()
+            if not timeout_future.done():
+                timeout_future.cancel()
+
+        if future not in done:
+            raise sqla_queue.Empty
+
+    async def _wait_for_future(self, future: "asyncio.Future[Any]") -> None:
+        await future
+
+    def _signal_next(self) -> None:
+        self._prune_done()
+        while self._waiters:
+            waiter = self._waiters[0]
+            if not waiter.event.is_set():
+                waiter.admitted = True
+                waiter.event.set()
+                return
+            self._waiters.popleft()
+
+    def _return_record(self, record: ConnectionPoolEntry) -> None:
+        try:
+            self._pool._pool.put_nowait(record)
+        except sqla_queue.Full:
+            record.close()
+            self._pool._dec_overflow()
+        self._prune_done()
+        self._signal_next()
+
+    def return_conn(self, record: ConnectionPoolEntry) -> None:
+        with self._lock:
+            self._prune_done()
+            if not self._waiters:
+                try:
+                    self._pool._pool.put_nowait(record)
+                except sqla_queue.Full:
+                    record.close()
+                    self._pool._dec_overflow()
+                return
+
+            if self._waiters[0].admitted:
+                record.close()
+                self._pool._dec_overflow()
+                self._signal_next()
+                return
+
+            waiter = self._waiters.popleft()
+            waiter.result = record
+            waiter.admitted = True
+            waiter.done = False
+            waiter.event.set()
 
 
 class QueuePool(Pool):
@@ -75,6 +220,7 @@ class QueuePool(Pool):
         max_overflow: int = 10,
         timeout: float = 30.0,
         use_lifo: bool = False,
+        strict_fifo: bool = False,
         **kw: Any,
     ):
         r"""
@@ -125,6 +271,13 @@ class QueuePool(Pool):
 
             :ref:`pool_disconnects`
 
+        :param strict_fifo: when True, checkouts that have to wait for a
+          saturated pool are admitted strictly in the order in which they
+          started waiting. A newly arriving checkout cannot be served by a
+          returned connection or a newly available overflow slot before a
+          checkout that is already waiting. This does not change
+          ``use_lifo``, which controls selection among idle connections.
+
         :param \**kw: Other keyword arguments including
           :paramref:`_pool.Pool.recycle`, :paramref:`_pool.Pool.echo`,
           :paramref:`_pool.Pool.reset_on_return` and others are passed to the
@@ -137,9 +290,15 @@ class QueuePool(Pool):
         self._overflow = 0 - pool_size
         self._max_overflow = -1 if pool_size == 0 else max_overflow
         self._timeout = timeout
+        self.strict_fifo = strict_fifo
+        self._strict_fifo_gate = _StrictFifoGate(self) if strict_fifo else None
         self._overflow_lock = threading.Lock()
 
     def _do_return_conn(self, record: ConnectionPoolEntry) -> None:
+        if self._strict_fifo_gate is not None:
+            self._strict_fifo_gate.return_conn(record)
+            return
+
         try:
             self._pool.put(record, False)
         except sqla_queue.Full:
@@ -152,6 +311,21 @@ class QueuePool(Pool):
         use_overflow = self._max_overflow > -1
 
         wait = use_overflow and self._overflow >= self._max_overflow
+        if self._strict_fifo_gate is not None and wait:
+            record = self._strict_fifo_gate.acquire(self._timeout)
+            if record is not None:
+                return record
+
+            if self._inc_overflow():
+                try:
+                    return self._create_connection()
+                except:
+                    with util.safe_reraise():
+                        self._dec_overflow()
+                        self._strict_fifo_gate._signal_next()
+                    raise
+            return self._do_get()
+
         try:
             return self._pool.get(wait, self._timeout)
         except sqla_queue.Empty:
@@ -207,6 +381,7 @@ class QueuePool(Pool):
             max_overflow=self._max_overflow,
             pre_ping=self._pre_ping,
             use_lifo=self._pool.use_lifo,
+            strict_fifo=self.strict_fifo,
             timeout=self._timeout,
             recycle=self._recycle,
             echo=self.echo,

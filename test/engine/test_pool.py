@@ -235,6 +235,16 @@ class PoolTest(PoolTestBase):
             pool.QueuePool,
             dict(pool_size=8, max_overflow=10, timeout=25, use_lifo=True),
         ),
+        (
+            pool.QueuePool,
+            dict(
+                pool_size=8,
+                max_overflow=10,
+                timeout=25,
+                use_lifo=True,
+                strict_fifo=True,
+            ),
+        ),
         (pool.QueuePool, {}),
         (pool.NullPool, {}),
         (pool.SingletonThreadPool, {}),
@@ -282,6 +292,8 @@ class PoolTest(PoolTestBase):
 
         if "use_lifo" in pool_args:
             eq_(p1._pool.use_lifo, p2._pool.use_lifo)
+        if "strict_fifo" in pool_args:
+            eq_(p1.strict_fifo, p2.strict_fifo)
 
     @testing.combinations(
         (pool.QueuePool, False),
@@ -2006,6 +2018,175 @@ class QueuePoolTest(PoolTestBase):
         pc2.close()
         pc3.close()
         pc1.close()
+
+
+class StrictFifoQueuePoolTest(PoolTestBase):
+    def _pool(self, **kw):
+        dbapi = MockDBAPI()
+        p = pool.QueuePool(
+            creator=lambda: dbapi.connect("foo.db"),
+            strict_fifo=True,
+            **kw,
+        )
+        return dbapi, p
+
+    def _start_waiters(self, p, targets):
+        gate = p._strict_fifo_gate
+        original_acquire = gate.acquire
+        idents = {}
+        arrived = [threading.Event() for _ in targets]
+        proceed = [threading.Event() for _ in targets]
+
+        def acquire(timeout):
+            index = idents.get(threading.get_ident())
+            if index is None:
+                return original_acquire(timeout)
+            arrived[index].set()
+            proceed[index].wait(join_timeout)
+            return original_acquire(timeout)
+
+        gate.acquire = acquire
+
+        threads = []
+        for index, target in enumerate(targets):
+            def runner(index=index):
+                idents[threading.get_ident()] = index
+                arrived[index].set()
+                proceed[index].wait(join_timeout)
+                target(index)
+
+            thread = threading.Thread(target=runner)
+            thread.start()
+            threads.append(thread)
+            arrived[index].wait(join_timeout)
+
+        for event in proceed:
+            event.set()
+        deadline = time.monotonic() + join_timeout
+        while gate.waiting() != len(targets):
+            if time.monotonic() > deadline:
+                break
+
+        gate.acquire = original_acquire
+        return threads
+
+    def test_returned_connection_cannot_be_taken_by_late_checkout(self):
+        dbapi, p = self._pool(pool_size=1, max_overflow=0, timeout=0.1)
+        results = []
+        errors = []
+        result_lock = threading.Lock()
+        first_holding = threading.Event()
+        release_first = threading.Event()
+
+        held = p.connect()
+        held_dbapi = held.dbapi_connection
+
+        def waiter(index):
+            try:
+                conn = p.connect()
+                with result_lock:
+                    results.append((index, conn.dbapi_connection))
+                if index == 0:
+                    first_holding.set()
+                    release_first.wait(join_timeout)
+                conn.close()
+            except BaseException as error:
+                with result_lock:
+                    errors.append((index, error))
+
+        threads = self._start_waiters(p, [waiter, waiter])
+        held.close()
+        first_holding.wait(join_timeout)
+
+        try:
+            late = p.connect()
+        except tsa.exc.TimeoutError as error:
+            late_error = error
+        else:
+            late.close()
+            raise AssertionError("late checkout bypassed an existing waiter")
+
+        release_first.set()
+        for thread in threads:
+            thread.join(join_timeout)
+
+        eq_([index for index, _ in results], [0, 1])
+        is_({connection for _, connection in results}, {held_dbapi})
+        eq_([index for index, _ in errors], [])
+        assert "timed out" in str(late_error)
+        eq_(p.checkedout(), 0)
+
+    def test_failed_connections_remove_successive_waiters(self):
+        dbapi = MockDBAPI()
+        create_failures = []
+
+        def creator():
+            if dbapi.is_shutdown:
+                create_failures.append(1)
+                raise Exception("connection failed")
+            return dbapi.connect("foo.db")
+
+        p = pool.QueuePool(
+            creator=creator,
+            pool_size=1,
+            max_overflow=0,
+            timeout=1,
+            strict_fifo=True,
+        )
+        held = p.connect()
+        results = []
+        errors = []
+
+        def waiter(index):
+            try:
+                results.append((index, p.connect()))
+            except BaseException as error:
+                errors.append((index, error))
+
+        threads = self._start_waiters(p, [waiter, waiter])
+        dbapi.is_shutdown = True
+        p._invalidate(held)
+        held.close()
+
+        for thread in threads:
+            thread.join(join_timeout)
+
+        eq_(len(create_failures), 2)
+        eq_([index for index, _ in errors], [0, 1])
+        is_(p._strict_fifo_gate.waiting(), False)
+
+        dbapi.is_shutdown = False
+        late = p.connect()
+        is_not(late.dbapi_connection, held.dbapi_connection)
+        late.close()
+        eq_(p.checkedout(), 0)
+
+    def test_checkout_reconnect_completes_waiter(self):
+        dbapi, p = self._pool(pool_size=1, max_overflow=0, timeout=1)
+        held = p.connect()
+        held_dbapi = held.dbapi_connection
+        results = []
+        reconnect = threading.Event()
+
+        @event.listens_for(p, "checkout")
+        def checkout(connection, record, fairy):
+            if not record.fresh and not reconnect.is_set():
+                reconnect.set()
+                raise tsa.exc.DisconnectionError()
+
+        def waiter(index):
+            results.append(p.connect())
+
+        thread = self._start_waiters(p, [waiter])[0]
+        p._invalidate(held)
+        held.close()
+        reconnect.wait(join_timeout)
+        thread.join(join_timeout)
+
+        eq_(len(results), 1)
+        is_not(results[0].dbapi_connection, held_dbapi)
+        results[0].close()
+        eq_(p.checkedout(), 0)
 
 
 class ResetOnReturnTest(PoolTestBase):

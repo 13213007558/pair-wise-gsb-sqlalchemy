@@ -78,6 +78,7 @@ def create_engine(
     pool_reset_on_return: Optional[_ResetStyleArgType] = ...,
     pool_timeout: float = ...,
     pool_use_lifo: bool = ...,
+    pool_strict_fifo: bool = ...,
     plugins: List[str] = ...,
     query_cache_size: int = ...,
     use_insertmanyvalues: bool = ...,
@@ -494,6 +495,12 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
 
             :ref:`pool_disconnects`
 
+    :param pool_strict_fifo=False: when True, checkouts that must wait for a
+        saturated :class:`~sqlalchemy.pool.QueuePool` are admitted strictly
+        in waiting order. This controls waiter fairness and is independent of
+        :paramref:`_sa.create_engine.pool_use_lifo`, which controls the order
+        in which idle connections are selected.
+
     :param plugins: string list of plugin names to load.  See
         :class:`.CreateEnginePlugin` for background.
 
@@ -850,6 +857,7 @@ def create_pool_from_url(
     reset_on_return: Optional[_ResetStyleArgType] = ...,
     timeout: float = ...,
     use_lifo: bool = ...,
+    strict_fifo: bool = ...,
     **kwargs: Any,
 ) -> Pool: ...
 
@@ -889,5 +897,6 @@ _pool_translate_kwargs = immutabledict(
         "reset_on_return": "pool_reset_on_return",
         "pre_ping": "pool_pre_ping",
         "use_lifo": "pool_use_lifo",
+        "strict_fifo": "pool_strict_fifo",
     }
 )
