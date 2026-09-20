@@ -230,8 +230,11 @@ class AsyncAdapt_aiosqlite_ss_cursor(AsyncAdapt_aiosqlite_cursor):
 
     def close(self) -> None:
         if self._cursor is not None:
-            self.await_(self._cursor.close())
-            self._cursor = None
+            if self._connection._connection is None:
+                self._cursor = None
+            else:
+                self.await_(self._cursor.close())
+                self._cursor = None
 
     def fetchone(self) -> Optional[Any]:
         assert self._cursor is not None

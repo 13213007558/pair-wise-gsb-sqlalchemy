@@ -1,11 +1,13 @@
 import asyncio
 import contextlib
+import datetime
 import inspect as stdlib_inspect
 from unittest.mock import patch
 
 from sqlalchemy import AssertionPool
 from sqlalchemy import Column
 from sqlalchemy import create_engine
+from sqlalchemy import Date
 from sqlalchemy import delete
 from sqlalchemy import event
 from sqlalchemy import exc
@@ -1208,6 +1210,116 @@ class AsyncResultTest(EngineFixture):
             all_ = await result.columns(1).all()
             eq_(all_, [("name%d" % i,) for i in range(1, 20)])
 
+    @async_test
+    async def test_freeze_unsupported_for_scalar_and_mapping_filters(
+        self, async_engine
+    ):
+        users = self.tables.users
+        async with async_engine.connect() as conn:
+            result = await conn.stream(select(users))
+            scalar_result = result.scalars()
+            mapping_result = result.mappings()
+
+            with expect_raises(AttributeError):
+                scalar_result.freeze()
+            with expect_raises(AttributeError):
+                mapping_result.freeze()
+
+            await result.close()
+
+    @testing.combinations(
+        (
+            None,
+            None,
+            [
+                (7, "name7"),
+                (8, "name8"),
+                (9, "name9"),
+                (7, "name7"),
+                (10, "name10"),
+            ],
+            ["user_id", "user_name"],
+        ),
+        (
+            "columns_unique",
+            None,
+            [(7, "name7"), (8, "name8"), (9, "name9"), (10, "name10")],
+            ["user_id", "user_name"],
+        ),
+        (
+            "unique",
+            None,
+            [(7, "name7"), (8, "name8"), (9, "name9"), (10, "name10")],
+            ["user_id", "user_name"],
+        ),
+        (
+            "column",
+            None,
+            [(7,), (8,), (9,), (7,), (10,)],
+            ["user_id"],
+        ),
+        (
+            "empty",
+            True,
+            [],
+            ["user_id", "user_name"],
+        ),
+        argnames="filter_,empty,expected_rows,expected_keys",
+    )
+    @async_test
+    async def test_freeze(
+        self,
+        async_engine,
+        filter_,
+        empty,
+        expected_rows,
+        expected_keys,
+    ):
+        users = self.tables.users
+        async with async_engine.connect() as conn:
+            if empty:
+                stmt = select(users).where(users.c.user_id == -1)
+            else:
+                selected_users = [
+                    select(users).where(users.c.user_id == user_id)
+                    for user_id in (7, 8, 9, 7, 10)
+                ]
+                stmt = union_all(*selected_users)
+
+            result = await conn.stream(stmt)
+
+            if filter_ == "columns_unique":
+                result = result.columns("user_id", "user_name").unique()
+            elif filter_ == "unique":
+                result = result.unique()
+            elif filter_ == "column":
+                result = result.columns("user_id")
+
+            frozen = await result.freeze()
+
+        result_one = frozen()
+        eq_(list(result_one.keys()), expected_keys)
+        eq_(result_one.all(), expected_rows)
+        eq_(result_one.all(), [])
+
+        result_two = frozen()
+        eq_(
+            result_two.mappings().all(),
+            [dict(zip(expected_keys, row)) for row in expected_rows],
+        )
+
+    @async_test
+    async def test_freeze_type_processing(self, async_engine):
+        stmt = text("select '2024-01-02' AS created_at").columns(
+            created_at=Date
+        )
+        async with async_engine.connect() as conn:
+            result = await conn.stream(stmt)
+            frozen = await result.freeze()
+
+        row = frozen().one()
+        eq_(row.created_at, datetime.date(2024, 1, 2))
+
     @testing.combinations(
         (None,), ("scalars",), ("mappings",), argnames="filter_"
     )
@@ -1400,6 +1512,67 @@ class AsyncResultTest(EngineFixture):
                 case.fail()
 
             eq_(u1, 1)
+
+
+class AsyncResultFreezeCleanupTest(fixtures.TestBase):
+    __requires__ = ("async_dialect", "server_side_cursors", "sqlite")
+
+    def _engine(self):
+        return create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            poolclass=StaticPool,
+        )
+
+    @async_test
+    async def test_freeze_database_error_cleanup(self):
+        engine = self._engine()
+        try:
+            async with engine.connect() as conn:
+                result = await conn.stream(text("select 1"))
+                cursor = result._real_result.cursor
+                raw_cursor = cursor._cursor
+
+                async def failing_fetchall():
+                    raise ZeroDivisionError()
+
+                raw_cursor.fetchall = failing_fetchall
+
+                with expect_raises(ZeroDivisionError):
+                    await result.freeze()
+
+                is_none(result._real_result.cursor)
+                is_none(cursor._cursor)
+        finally:
+            await engine.dispose()
+
+    @async_test
+    async def test_freeze_cancelled_cleanup(self):
+        engine = self._engine()
+        try:
+            async with engine.connect() as conn:
+                async with conn.stream(text("select 1")) as result:
+                    cursor = result._real_result.cursor
+                    raw_cursor = cursor._cursor
+                    original_fetchall = raw_cursor.fetchall
+                    started = asyncio.Event()
+
+                    async def slow_fetchall():
+                        started.set()
+                        await asyncio.Event().wait()
+
+                    raw_cursor.fetchall = slow_fetchall
+
+                    task = asyncio.create_task(result.freeze())
+                    await started.wait()
+                    task.cancel()
+
+                    with expect_raises(asyncio.CancelledError):
+                        await task
+
+                is_none(result._real_result.cursor)
+                is_none(cursor._cursor)
+        finally:
+            await engine.dispose()
 
 
 class TextSyncDBAPI(fixtures.TestBase):

@@ -227,6 +227,31 @@ class AsyncSessionQueryTest(AsyncFixture):
         eq_(result, self.static.user_address_result)
 
     @async_test
+    async def test_stream_freeze_orm_scalar_source(self, async_session):
+        User = self.classes.User
+        stmt = select(User).order_by(User.id)
+
+        result = await async_session.stream(stmt)
+        frozen = await result.freeze()
+        is_true(frozen._attributes["is_single_entity"])
+
+        result_one = frozen()
+        eq_(list(result_one.keys()), ["User"])
+        users_one = result_one.scalars().all()
+        eq_([user.id for user in users_one], [7, 8, 9, 10])
+
+        result_two = frozen()
+        mappings_two = result_two.mappings().all()
+        eq_(
+            [mapping["User"].id for mapping in mappings_two],
+            [7, 8, 9, 10],
+        )
+
+        result_three = frozen()
+        users_two = list(result_three)
+        eq_([row[0].id for row in users_two], [7, 8, 9, 10])
+
+    @async_test
     async def test_get(self, async_session):
         User = self.classes.User
 

@@ -442,7 +442,31 @@ class AsyncResult(_WithKeys, AsyncCommon[Row[_TP]]):
 
         """
 
-        return await greenlet_spawn(FrozenResult, self)
+        frozen: FrozenResult[_TP] = FrozenResult.__new__(FrozenResult)
+        frozen.metadata = self._metadata._for_freeze()
+        frozen._attributes = self._real_result._attributes
+
+        use_raw_row_iterator = (
+            self._real_result._source_supports_scalars
+            and self._metadata is self._real_result._metadata
+            and self._unique_filter_state
+            is self._real_result._unique_filter_state
+        )
+        try:
+            if use_raw_row_iterator:
+                frozen._source_supports_scalars = True
+                data = await greenlet_spawn(
+                    list, self._real_result._raw_row_iterator()
+                )
+            else:
+                frozen._source_supports_scalars = False
+                data = await self.all()
+        except BaseException:
+            await self.close()
+            raise
+
+        frozen.data = data
+        return frozen
 
     @overload
     def scalars(
