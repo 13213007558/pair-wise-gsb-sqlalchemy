@@ -14,6 +14,7 @@ from sqlalchemy import inspect
 from sqlalchemy import Integer
 from sqlalchemy import NullPool
 from sqlalchemy import QueuePool
+from sqlalchemy import Result
 from sqlalchemy import select
 from sqlalchemy import SingletonThreadPool
 from sqlalchemy import StaticPool
@@ -24,6 +25,7 @@ from sqlalchemy import text
 from sqlalchemy import true
 from sqlalchemy import union_all
 from sqlalchemy.engine import cursor as _cursor
+from sqlalchemy.dialects.sqlite import aiosqlite as sqlite_aiosqlite
 from sqlalchemy.ext.asyncio import async_engine_from_config
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.ext.asyncio import create_async_pool_from_url
@@ -51,6 +53,7 @@ from sqlalchemy.testing import is_not
 from sqlalchemy.testing import is_true
 from sqlalchemy.testing import mock
 from sqlalchemy.testing import ne_
+from sqlalchemy.util import await_only
 from sqlalchemy.util import greenlet_spawn
 
 
@@ -1207,6 +1210,140 @@ class AsyncResultTest(EngineFixture):
 
             all_ = await result.columns(1).all()
             eq_(all_, [("name%d" % i,) for i in range(1, 20)])
+
+    @testing.combinations(
+        (
+            False,
+            False,
+            "rows",
+            [(1, "name1"), (1, "name1"), (2, "name2"), (2, "name2")],
+        ),
+        (
+            False,
+            True,
+            "columns",
+            [
+                ("name1",),
+                ("name1",),
+                ("name2",),
+                ("name2",),
+            ],
+        ),
+        (True, False, "unique", [(1, "name1"), (2, "name2")]),
+        (
+            True,
+            True,
+            "unique_columns",
+            [("name1",), ("name2",)],
+        ),
+        argnames="unique_, columns_, name, expected",
+    )
+    @async_test
+    async def test_freeze(
+        self, async_engine, unique_, columns_, name, expected
+    ):
+        del name
+        users = self.tables.users
+        async with async_engine.connect() as conn:
+            result = await conn.stream(
+                union_all(
+                    select(users).where(users.c.user_id.in_([1, 2])),
+                    select(users).where(users.c.user_id.in_([2, 1])),
+                ).order_by(users.c.user_id, users.c.user_name)
+            )
+
+            if columns_:
+                result = result.columns(users.c.user_name)
+            if unique_:
+                result = result.unique()
+
+            frozen = await result.freeze()
+
+        first = frozen()
+        second = frozen()
+        third = frozen()
+
+        assert isinstance(first, Result)
+        assert isinstance(second, Result)
+        assert isinstance(third, Result)
+        eq_(
+            first.keys(),
+            ["user_name"] if columns_ else ["user_id", "user_name"],
+        )
+        eq_(
+            third.mappings().all(),
+            [dict(zip(third.keys(), row)) for row in expected],
+        )
+        eq_(first.all(), expected)
+        eq_(second.all(), expected)
+        eq_(first.all(), [])
+        eq_(second.all(), [])
+
+    @async_test
+    async def test_freeze_empty(self, async_engine):
+        users = self.tables.users
+        async with async_engine.connect() as conn:
+            result = await conn.stream(
+                select(users).where(users.c.user_id == 99)
+            )
+            frozen = await result.freeze()
+
+        eq_(frozen().keys(), ["user_id", "user_name"])
+        eq_(frozen().all(), [])
+
+    @async_test
+    async def test_freeze_mappings_unsupported(self, async_engine):
+        users = self.tables.users
+        async with async_engine.connect() as conn:
+            result = await conn.stream(select(users))
+
+            assert not hasattr(result.scalars(1), "freeze")
+            assert not hasattr(result.mappings(), "freeze")
+
+    @async_test
+    async def test_freeze_database_error_closes_result(self, async_engine):
+        if not testing.against("sqlite+aiosqlite"):
+            testing.skip_test("aiosqlite specific database error fixture")
+
+        async with async_engine.connect() as conn:
+            result = await conn.stream(text("SELECT 1 UNION ALL SELECT 2"))
+            await result._real_result.cursor._cursor.close()
+
+            with expect_raises_message(
+                exc.ProgrammingError, "closed cursor"
+            ):
+                await result.freeze()
+
+            is_true(result.closed)
+
+    @async_test
+    async def test_freeze_cancelled_closes_result(self, async_engine):
+        if not testing.against("sqlite+aiosqlite"):
+            testing.skip_test("aiosqlite specific cancellation fixture")
+
+        async with async_engine.connect() as conn:
+            result = await conn.stream(text("SELECT 1"))
+
+            async def cancelled_fetchall_async(self):
+                del self
+                await asyncio.sleep(10)
+
+            def cancelled_fetchall(self):
+                return await_only(cancelled_fetchall_async())
+
+            with patch.object(
+                sqlite_aiosqlite.AsyncAdapt_aiosqlite_ss_cursor,
+                "fetchall",
+                cancelled_fetchall,
+            ):
+                task = asyncio.create_task(result.freeze())
+                await asyncio.sleep(0)
+                task.cancel()
+
+                with expect_raises(asyncio.CancelledError):
+                    await task
+
+            is_true(result.closed)
 
     @testing.combinations(
         (None,), ("scalars",), ("mappings",), argnames="filter_"

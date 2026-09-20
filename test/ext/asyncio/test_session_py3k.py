@@ -11,6 +11,7 @@ from sqlalchemy import func
 from sqlalchemy import Identity
 from sqlalchemy import inspect
 from sqlalchemy import Integer
+from sqlalchemy import Result
 from sqlalchemy import select
 from sqlalchemy import Sequence
 from sqlalchemy import String
@@ -225,6 +226,36 @@ class AsyncSessionQueryTest(AsyncFixture):
         elif filter_ == "stream_scalars":
             result = await (await async_session.stream_scalars(stmt)).all()
         eq_(result, self.static.user_address_result)
+
+    @async_test
+    async def test_stream_freeze_orm_scalar_source(self, async_session):
+        User = self.classes.User
+
+        stmt = (
+            select(User)
+            .options(selectinload(User.addresses))
+            .order_by(User.id)
+            .limit(2)
+        )
+        result = await async_session.stream(stmt)
+        frozen = await result.freeze()
+
+        await async_session.close()
+
+        first = frozen()
+        second = frozen()
+
+        assert isinstance(first, Result)
+        eq_(list(first.keys()), ["User"])
+        is_true(first._attributes["is_single_entity"])
+        first_users = first.scalars().all()
+        second_users = second.scalars().all()
+
+        eq_([user.id for user in first_users], [7, 8])
+        eq_([user.name for user in first_users], ["jack", "ed"])
+        is_true(isinstance(first_users[0].id, int))
+        eq_([user.id for user in second_users], [7, 8])
+        eq_([user.name for user in second_users], ["jack", "ed"])
 
     @async_test
     async def test_get(self, async_session):

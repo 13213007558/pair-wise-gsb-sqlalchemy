@@ -422,8 +422,8 @@ class AsyncResult(_WithKeys, AsyncCommon[Row[_TP]]):
         return await greenlet_spawn(self._only_one_row, False, False, True)
 
     async def freeze(self) -> FrozenResult[_TP]:
-        """Return a callable object that will produce copies of this
-        :class:`_asyncio.AsyncResult` when invoked.
+        """Return a callable object that will produce synchronous
+        :class:`_engine.Result` copies when invoked.
 
         The callable object returned is an instance of
         :class:`_engine.FrozenResult`.
@@ -442,7 +442,26 @@ class AsyncResult(_WithKeys, AsyncCommon[Row[_TP]]):
 
         """
 
-        return await greenlet_spawn(FrozenResult, self)
+        try:
+            data = await greenlet_spawn(self._allrows)
+        except BaseException:
+            await greenlet_spawn(self._real_result.close)
+            raise
+
+        frozen_result = FrozenResult.__new__(FrozenResult)
+        frozen_result.metadata = self._metadata._for_freeze()
+        frozen_result._attributes = self._attributes
+        frozen_result._source_supports_scalars = (
+            self._real_result._source_supports_scalars
+            and len(self._metadata.keys) == 1
+        )
+
+        if frozen_result._source_supports_scalars:
+            frozen_result.data = [row[0] for row in data]
+        else:
+            frozen_result.data = data
+
+        return frozen_result
 
     @overload
     def scalars(
