@@ -1,0 +1,13 @@
+.. changelog::
+    :tags: bug, sqlite, reflection
+    :tickets: 11677, 11840
+
+    Reworked SQLite CHECK constraint reflection to tokenize and parse the
+    stored ``CREATE TABLE`` statement instead of relying on a regular
+    expression.  CHECK constraints are now reflected correctly regardless of
+    how the DDL was formatted by external tools, including constraints that
+    span multiple lines, multiple constraints on a single line, column-level
+    and table-level constraints, and expressions that contain nested
+    parentheses, string literals, quoted identifiers, or SQL comments.
+    Constraint expressions are preserved verbatim so that they remain valid,
+    re-compilable SQL.

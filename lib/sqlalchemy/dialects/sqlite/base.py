@@ -2041,6 +2041,172 @@ class SQLiteExecutionContext(default.DefaultExecutionContext):
             return colname, None
 
 
+class _DDLConstraintParser:
+    """Parses the text of a SQLite ``CREATE TABLE`` statement in order to
+    extract CHECK constraint definitions.
+
+    SQLite stores the original text of the ``CREATE TABLE`` statement,
+    which may have been emitted by external tools in arbitrary formats:
+    constraints may span multiple lines, several constraints may share a
+    single line, and constraint expressions may contain nested
+    parentheses, string literals, quoted identifiers and SQL comments.
+    None of these may be mistaken for constraint boundaries, which a
+    regular expression cannot reliably guarantee, so the statement is
+    tokenized and scanned instead.  Constraint expressions are extracted
+    verbatim from the statement so that they remain valid,
+    re-compilable SQL.
+
+    """
+
+    # characters that may not appear inside a bare word token.  each of
+    # these is handled by an explicit branch of the tokenizer, so a word
+    # token always starts on a character that is not in this set.
+    _word_delimiter = re.compile(r"[\s'\"`\[\(),\-/]")
+
+    def __init__(self, dialect):
+        self.dialect = dialect
+
+    def _tokenize_sql(self, sql):
+        """Yield ``(kind, text, start, end)`` tokens for the given SQL.
+
+        Whitespace is skipped.  Comments are emitted as tokens so that
+        they remain part of the raw source positions used to extract
+        constraint expressions, while still being ignorable when
+        scanning for keywords.
+        """
+
+        pos = 0
+        end = len(sql)
+        while pos < end:
+            char = sql[pos]
+            if char.isspace():
+                pos += 1
+            elif char == "'":
+                # string literal; '' is an escaped quote
+                stop = pos + 1
+                while stop < end:
+                    if sql[stop] == "'":
+                        if stop + 1 < end and sql[stop + 1] == "'":
+                            stop += 2
+                        else:
+                            stop += 1
+                            break
+                    else:
+                        stop += 1
+                yield "string", sql[pos:stop], pos, stop
+                pos = stop
+            elif char == '"' or char == "`":
+                # quoted identifier; "" or `` is an escaped quote
+                stop = pos + 1
+                while stop < end:
+                    if sql[stop] == char:
+                        if stop + 1 < end and sql[stop + 1] == char:
+                            stop += 2
+                        else:
+                            stop += 1
+                            break
+                    else:
+                        stop += 1
+                yield "qident", sql[pos:stop], pos, stop
+                pos = stop
+            elif char == "[":
+                # bracket-quoted identifier; no escape sequence
+                stop = sql.find("]", pos + 1)
+                stop = end if stop == -1 else stop + 1
+                yield "qident", sql[pos:stop], pos, stop
+                pos = stop
+            elif char == "-" and sql.startswith("--", pos):
+                stop = sql.find("\n", pos + 2)
+                stop = end if stop == -1 else stop
+                yield "comment", sql[pos:stop], pos, stop
+                pos = stop
+            elif char == "/" and sql.startswith("/*", pos):
+                stop = sql.find("*/", pos + 2)
+                stop = end if stop == -1 else stop + 2
+                yield "comment", sql[pos:stop], pos, stop
+                pos = stop
+            elif char in "(),":
+                yield char, char, pos, pos + 1
+                pos += 1
+            elif char in "-/":
+                # a '-' or '/' that does not start a comment
+                yield "other", char, pos, pos + 1
+                pos += 1
+            else:
+                match = self._word_delimiter.search(sql, pos)
+                stop = end if match is None else match.start()
+                yield "word", sql[pos:stop], pos, stop
+                pos = stop
+
+    def _unquote_identifier(self, identifier):
+        if len(identifier) >= 2:
+            if identifier[0] == '"' and identifier[-1] == '"':
+                return identifier[1:-1].replace('""', '"')
+            elif identifier[0] == "`" and identifier[-1] == "`":
+                return identifier[1:-1].replace("``", "`")
+            elif identifier[0] == "[" and identifier[-1] == "]":
+                return identifier[1:-1]
+        return identifier
+
+    def parse_check_constraints(self, sql):
+        """Return a list of ``{"name": ..., "sqltext": ...}`` dicts for
+        each CHECK constraint found in a ``CREATE TABLE`` statement.
+
+        Both table-level and column-level constraints are located, with
+        named constraints reporting their unquoted name and anonymous
+        constraints reporting ``None``.
+        """
+
+        tokens = [
+            tok for tok in self._tokenize_sql(sql) if tok[0] != "comment"
+        ]
+        checks = []
+        for idx, token in enumerate(tokens):
+            if token[0] != "word" or token[1].upper() != "CHECK":
+                continue
+
+            # a CHECK keyword may be preceded by "CONSTRAINT <name>",
+            # where the name may be a bare or quoted identifier
+            name = None
+            if idx >= 2:
+                constraint_tok = tokens[idx - 2]
+                name_tok = tokens[idx - 1]
+                if (
+                    constraint_tok[0] == "word"
+                    and constraint_tok[1].upper() == "CONSTRAINT"
+                    and name_tok[0] in ("word", "qident")
+                ):
+                    if name_tok[0] == "qident":
+                        name = self._unquote_identifier(name_tok[1])
+                    else:
+                        name = name_tok[1]
+
+            # the CHECK keyword must be directly followed by a
+            # parenthesized expression
+            if idx + 1 >= len(tokens) or tokens[idx + 1][0] != "(":
+                continue
+            open_paren = tokens[idx + 1]
+            depth = 1
+            scan = idx + 2
+            while scan < len(tokens) and depth:
+                if tokens[scan][0] == "(":
+                    depth += 1
+                elif tokens[scan][0] == ")":
+                    depth -= 1
+                scan += 1
+            if depth:
+                # unbalanced parentheses; the statement is not valid,
+                # skip this occurrence
+                continue
+            close_paren = tokens[scan - 1]
+
+            # extract the expression verbatim from the original
+            # statement, preserving any whitespace and comments within
+            expression = sql[open_paren[3] : close_paren[2]]
+            checks.append({"name": name, "sqltext": expression.strip()})
+        return checks
+
+
 class SQLiteDialect(default.DefaultDialect):
     name = "sqlite"
     supports_alter = False
@@ -2133,6 +2299,8 @@ class SQLiteDialect(default.DefaultDialect):
         **kwargs,
     ):
         default.DefaultDialect.__init__(self, **kwargs)
+
+        self._constraint_parser = _DDLConstraintParser(self)
 
         if _json_serializer:
             json_serializer = _json_serializer
@@ -2771,27 +2939,10 @@ class SQLiteDialect(default.DefaultDialect):
             connection, table_name, schema=schema, **kw
         )
 
-        # NOTE NOTE NOTE
-        # DO NOT CHANGE THIS REGULAR EXPRESSION.   There is no known way
-        # to parse CHECK constraints that contain newlines themselves using
-        # regular expressions, and the approach here relies upon each
-        # individual
-        # CHECK constraint being on a single line by itself.   This
-        # necessarily makes assumptions as to how the CREATE TABLE
-        # was emitted.   A more comprehensive DDL parsing solution would be
-        # needed to improve upon the current situation. See #11840 for
-        # background
-        CHECK_PATTERN = r"(?:CONSTRAINT (.+) +)?CHECK *\( *(.+) *\),? *"
-        cks = []
+        if table_data is None:
+            return ReflectionDefaults.check_constraints()
 
-        for match in re.finditer(CHECK_PATTERN, table_data or "", re.I):
-
-            name = match.group(1)
-
-            if name:
-                name = re.sub(r'^"|"$', "", name)
-
-            cks.append({"sqltext": match.group(2), "name": name})
+        cks = self._constraint_parser.parse_check_constraints(table_data)
         cks.sort(key=lambda d: d["name"] or "~")  # sort None as last
         if cks:
             return cks

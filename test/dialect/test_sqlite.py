@@ -2576,7 +2576,6 @@ class ConstraintReflectionTest(fixtures.TestBase):
             ],
         )
 
-    @testing.fails("need to come up with new regex and/or DDL parsing")
     def test_check_constraint_multiline(self):
         """test for #11677"""
 
@@ -2660,6 +2659,203 @@ class ConstraintReflectionTest(fixtures.TestBase):
             eq_(const["column_names"], [expected])
         else:
             assert False
+
+
+class CheckConstraintDDLReflectionTest(fixtures.TestBase):
+    """Reflection of CHECK constraints from CREATE TABLE statements
+    formatted in arbitrary ways, as may be produced by external
+    migration tools: multi-line expressions, several constraints on a
+    single line, column-level and table-level constraints, nested
+    parentheses, string literals, quoted identifiers and SQL comments.
+    See #11677, #11840.
+
+    """
+
+    __only_on__ = "sqlite"
+    __backend__ = True
+
+    ddl = (
+        "CREATE TABLE ck_fmt (\n"
+        "  id INTEGER PRIMARY KEY,\n"
+        "  -- a line comment mentioning CHECK (id < 0), not a constraint\n"
+        "  val TEXT CHECK (val <> 'not a CHECK (constraint), really'),\n"
+        "  qty INTEGER CHECK (qty IN (1, 2, 3)),\n"
+        "  price INTEGER CHECK (price > 0),\n"
+        '  "quoted col" INTEGER /* block comment with CHECK (1 = 1) */\n'
+        '  CHECK ("quoted col" < 100),\n'
+        "  [bracket col] INTEGER CONSTRAINT ck_bracket\n"
+        "      CHECK ([bracket col] > 0),\n"
+        "  CONSTRAINT ck_multi CHECK (\n"
+        "     (qty > 0) AND\n"
+        "     /* a block comment with ) and , and CHECK ( */\n"
+        "     (qty < 1000)\n"
+        "  ),\n"
+        '  CONSTRAINT "weird ""name""" CHECK (price < 10000),'
+        " CHECK (id > 0)\n"
+        ")"
+    )
+
+    expected = [
+        {"name": "ck_bracket", "sqltext": "[bracket col] > 0"},
+        {
+            "name": "ck_multi",
+            "sqltext": "(qty > 0) AND\n"
+            "     /* a block comment with ) and , and CHECK ( */\n"
+            "     (qty < 1000)",
+        },
+        {"name": 'weird "name"', "sqltext": "price < 10000"},
+        {
+            "name": None,
+            "sqltext": "val <> 'not a CHECK (constraint), really'",
+        },
+        {"name": None, "sqltext": "qty IN (1, 2, 3)"},
+        {"name": None, "sqltext": "price > 0"},
+        {"name": None, "sqltext": '"quoted col" < 100'},
+        {"name": None, "sqltext": "id > 0"},
+    ]
+
+    def _table_checks(self, table):
+        return sorted(
+            (
+                (ck.name, str(ck.sqltext))
+                for ck in table.constraints
+                if isinstance(ck, CheckConstraint)
+            ),
+            key=lambda ck: (ck[0] or "~", ck[1]),
+        )
+
+    def _expected_sorted(self):
+        return sorted(
+            ((ck["name"], ck["sqltext"]) for ck in self.expected),
+            key=lambda ck: (ck[0] or "~", ck[1]),
+        )
+
+    @testing.fixture
+    def ck_fmt_table(self, connection):
+        connection.exec_driver_sql(self.ddl)
+        try:
+            yield
+        finally:
+            connection.exec_driver_sql("DROP TABLE ck_fmt")
+
+    def test_get_check_constraints(self, connection, ck_fmt_table):
+        inspector = inspect(connection)
+        eq_(inspector.get_check_constraints("ck_fmt"), self.expected)
+
+    def test_get_check_constraints_no_such_table(self, connection):
+        inspector = inspect(connection)
+        assert_raises(
+            exc.NoSuchTableError,
+            inspector.get_check_constraints,
+            "does_not_exist",
+        )
+
+    def test_get_check_constraints_attached_schema(self, connection):
+        connection.exec_driver_sql("ATTACH DATABASE ':memory:' AS aux")
+        try:
+            connection.exec_driver_sql(
+                "CREATE TABLE aux.ck_aux (\n"
+                "  x INTEGER CHECK (x > 0),\n"
+                "  CONSTRAINT ck_aux_multi CHECK (\n"
+                "     (x < 100) AND\n"
+                "     (x <> 50)\n"
+                "  )\n"
+                ")"
+            )
+            inspector = inspect(connection)
+            eq_(
+                inspector.get_check_constraints("ck_aux", schema="aux"),
+                [
+                    {
+                        "name": "ck_aux_multi",
+                        "sqltext": "(x < 100) AND\n     (x <> 50)",
+                    },
+                    {"name": None, "sqltext": "x > 0"},
+                ],
+            )
+
+            meta = MetaData()
+            table = Table(
+                "ck_aux", meta, autoload_with=connection, schema="aux"
+            )
+            eq_(
+                self._table_checks(table),
+                sorted(
+                    [
+                        ("ck_aux_multi", "(x < 100) AND\n     (x <> 50)"),
+                        (None, "x > 0"),
+                    ],
+                    key=lambda ck: (ck[0] or "~", ck[1]),
+                ),
+            )
+        finally:
+            connection.exec_driver_sql("DETACH DATABASE aux")
+
+    def test_inspector_autoload_reflect_consistent(
+        self, connection, ck_fmt_table
+    ):
+        meta = MetaData()
+        table = Table("ck_fmt", meta, autoload_with=connection)
+        eq_(self._table_checks(table), self._expected_sorted())
+
+        meta2 = MetaData()
+        meta2.reflect(connection)
+        eq_(
+            self._table_checks(meta2.tables["ck_fmt"]), self._expected_sorted()
+        )
+
+    def test_roundtrip_constraint_enforcement(self):
+        src_engine = create_engine("sqlite://")
+        with src_engine.begin() as conn:
+            conn.exec_driver_sql(self.ddl)
+
+        meta = MetaData()
+        meta.reflect(src_engine, only=["ck_fmt"])
+        eq_(
+            self._table_checks(meta.tables["ck_fmt"]), self._expected_sorted()
+        )
+
+        # compile the reflected table into a brand new database
+        dest_engine = create_engine("sqlite://")
+        meta.create_all(dest_engine)
+
+        # the constraints reflected from the new database are the same
+        # as the ones reflected from the original database
+        insp = inspect(dest_engine)
+        eq_(insp.get_check_constraints("ck_fmt"), self.expected)
+
+        cols = '(id, val, qty, price, "quoted col", [bracket col])'
+        valid_row = "(1, 'ok', 2, 5, 50, 10)"
+        statements = [
+            # one row that satisfies every constraint
+            "INSERT INTO ck_fmt %s VALUES %s" % (cols, valid_row),
+            # one row violating each constraint in turn
+            "INSERT INTO ck_fmt %s VALUES "
+            "(2, 'not a CHECK (constraint), really', 2, 5, 50, 10)" % cols,
+            "INSERT INTO ck_fmt %s VALUES (3, 'ok', 7, 5, 50, 10)" % cols,
+            "INSERT INTO ck_fmt %s VALUES (4, 'ok', 2, -1, 50, 10)" % cols,
+            "INSERT INTO ck_fmt %s VALUES (5, 'ok', 2, 5, 150, 10)" % cols,
+            "INSERT INTO ck_fmt %s VALUES (6, 'ok', 2, 5, 50, -3)" % cols,
+            "INSERT INTO ck_fmt %s VALUES (7, 'ok', 1001, 5, 50, 10)" % cols,
+            "INSERT INTO ck_fmt %s VALUES (8, 'ok', 2, 20000, 50, 10)" % cols,
+            "INSERT INTO ck_fmt %s VALUES (-9, 'ok', 2, 5, 50, 10)" % cols,
+        ]
+
+        def outcomes(engine):
+            results = []
+            for stmt in statements:
+                try:
+                    with engine.begin() as conn:
+                        conn.exec_driver_sql(stmt)
+                except exc.IntegrityError:
+                    results.append(False)
+                else:
+                    results.append(True)
+            return results
+
+        src_outcomes = outcomes(src_engine)
+        eq_(src_outcomes, [True] + [False] * 8)
+        eq_(outcomes(dest_engine), src_outcomes)
 
 
 class SavepointTest(fixtures.TablesTest):
