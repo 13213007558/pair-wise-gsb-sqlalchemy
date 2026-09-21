@@ -1,7 +1,11 @@
 """SQLite-specific tests."""
 
+import os
+import tempfile
+
 from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
+from sqlalchemy import create_engine
 from sqlalchemy import DDL
 from sqlalchemy import event
 from sqlalchemy import exc
@@ -18,6 +22,7 @@ from sqlalchemy.sql.elements import quoted_name
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import eq_
 from sqlalchemy.testing import expect_raises
+from sqlalchemy.testing import expect_warnings
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import is_
 from sqlalchemy.testing import is_true
@@ -78,6 +83,281 @@ class KeywordInDatabaseNameTest(fixtures.TestBase):
         meta = MetaData(schema="default")
         meta.reflect(connection)
         assert "default.a" in meta.tables
+
+
+class ExpressionIndexReflectionTest(fixtures.TestBase):
+    __only_on__ = "sqlite"
+    __backend__ = True
+    __requires__ = ("sqlite_partial_indexes",)
+
+    def test_expression_index_roundtrip_and_semantics(self):
+        source_engine = create_engine("sqlite:///:memory:")
+        target_engine = create_engine("sqlite:///:memory:")
+
+        with source_engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE expr_index_table ("
+                "id INTEGER PRIMARY KEY, "
+                "a TEXT, b TEXT, c TEXT, active INTEGER, "
+                '"weird col, name" TEXT)'
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX ix_plain ON expr_index_table (b, a)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX ix_plain_ordered ON expr_index_table "
+                "(b ASC, a DESC)"
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX ix_mixed ON expr_index_table ("
+                "lower(a), "
+                "b COLLATE NOCASE DESC, "
+                "substr(c, 1, 4), "
+                "replace(c, 'comma, where ''x''', 'y'), "
+                "(b || c), "
+                '"weird col, name")'
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX ix_nested ON expr_index_table ("
+                "coalesce(lower(a), trim(b), 'x, ''where'''), "
+                "abs(length(c) * 2) DESC)"
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX ix_partial ON expr_index_table (a) "
+                "-- newline\n"
+                "WHERE\n"
+                "  active = 1\n"
+                "  AND c <> 'x, where)'"
+            )
+
+            inspector = inspect(conn)
+            indexes = {
+                index["name"]: index
+                for index in inspector.get_indexes("expr_index_table")
+            }
+
+            eq_(indexes["ix_plain"]["column_names"], ["b", "a"])
+            is_("expressions" not in indexes["ix_plain"], True)
+            eq_(
+                indexes["ix_plain_ordered"]["column_names"],
+                ["b", None],
+            )
+            eq_(
+                indexes["ix_plain_ordered"]["expressions"], ["b", "a"]
+            )
+            eq_(
+                indexes["ix_plain_ordered"]["column_sorting"],
+                {"a": ("desc",)},
+            )
+
+            eq_(
+                indexes["ix_mixed"]["column_names"],
+                [None, None, None, None, None, "weird col, name"],
+            )
+            eq_(
+                indexes["ix_mixed"]["expressions"],
+                [
+                    "lower(a)",
+                    "b COLLATE NOCASE",
+                    "substr(c, 1, 4)",
+                    "replace(c, 'comma, where ''x''', 'y')",
+                    "(b || c)",
+                    "weird col, name",
+                ],
+            )
+            eq_(
+                indexes["ix_mixed"]["column_sorting"],
+                {"b COLLATE NOCASE": ("desc",)},
+            )
+            eq_(
+                indexes["ix_nested"]["expressions"],
+                [
+                    "coalesce(lower(a), trim(b), 'x, ''where''')",
+                    "abs(length(c) * 2)",
+                ],
+            )
+            eq_(
+                indexes["ix_nested"]["column_sorting"],
+                {"abs(length(c) * 2)": ("desc",)},
+            )
+            eq_(
+                indexes["ix_partial"]["dialect_options"]["sqlite_where"].text,
+                "active = 1\n  AND c <> 'x, where)'",
+            )
+
+        metadata = MetaData()
+        reflected_table = Table(
+            "expr_index_table", metadata, autoload_with=source_engine
+        )
+
+        with target_engine.begin() as conn:
+            metadata.create_all(conn)
+
+            reflected_indexes = conn.exec_driver_sql(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' "
+                "ORDER BY name"
+            ).all()
+            reflected_sql = {name: sql for name, sql in reflected_indexes}
+            is_true("a desc" in reflected_sql["ix_plain_ordered"])
+            is_true("b COLLATE NOCASE desc" in reflected_sql["ix_mixed"])
+            is_true("lower(a)" in reflected_sql["ix_mixed"])
+            is_true("WHERE" in reflected_sql["ix_partial"])
+
+            conn.execute(
+                reflected_table.insert(),
+                {
+                    "a": "ABC",
+                    "b": "B",
+                    "c": "comma, where 'x'",
+                    "active": 1,
+                    "weird col, name": "w",
+                },
+            )
+            with expect_raises(exc.IntegrityError):
+                conn.execute(
+                    reflected_table.insert(),
+                    {
+                        "a": "abc",
+                        "b": "B",
+                        "c": "comma, where 'x'",
+                        "active": 1,
+                        "weird col, name": "w",
+                    },
+                )
+
+            conn.execute(
+                reflected_table.insert(),
+                {"a": "abc", "active": 0, "c": "other"},
+            )
+            conn.execute(
+                reflected_table.insert(),
+                {"a": "abc", "active": 0, "c": "other"},
+            )
+
+            eq_(
+                conn.exec_driver_sql(
+                    "SELECT count(*) FROM expr_index_table"
+                ).scalar(),
+                3,
+            )
+
+        source_engine.dispose()
+        target_engine.dispose()
+
+    def test_attached_schema_index_namespace(self):
+        main_fd, main_path = tempfile.mkstemp(suffix=".db")
+        other_fd, other_path = tempfile.mkstemp(suffix=".db")
+        target_other_fd, target_other_path = tempfile.mkstemp(suffix=".db")
+        os.close(main_fd)
+        os.close(other_fd)
+        os.close(target_other_fd)
+
+        try:
+            main_engine = create_engine(f"sqlite:///{main_path}")
+            other_engine = create_engine(f"sqlite:///{other_path}")
+
+            with main_engine.begin() as conn:
+                conn.exec_driver_sql(
+                    'CREATE TABLE "attached table" (x TEXT)'
+                )
+                conn.exec_driver_sql(
+                    'CREATE INDEX "ix same" ON "attached table" (x)'
+                )
+
+            with other_engine.begin() as conn:
+                conn.exec_driver_sql(
+                    'CREATE TABLE "attached table" (x TEXT)'
+                )
+                conn.exec_driver_sql(
+                    'CREATE INDEX "ix same" ON "attached table" '
+                    "(lower(x))"
+                )
+
+            main_engine.dispose()
+            other_engine.dispose()
+
+            source_engine = create_engine(f"sqlite:///{main_path}")
+            target_engine = create_engine(f"sqlite:///{main_path}.target")
+            with source_engine.begin() as conn:
+                attach_path = other_path.replace("'", "''")
+                conn.exec_driver_sql(
+                    f"ATTACH DATABASE '{attach_path}' AS \"other schema\""
+                )
+                main_indexes = inspect(conn).get_indexes("attached table")
+                other_indexes = inspect(conn).get_indexes(
+                    "attached table", schema="other schema"
+                )
+                eq_(main_indexes[0]["column_names"], ["x"])
+                eq_(other_indexes[0]["column_names"], [None])
+                eq_(other_indexes[0]["expressions"], ["lower(x)"])
+
+            main_metadata = MetaData()
+            Table(
+                "attached table",
+                main_metadata,
+                autoload_with=source_engine,
+            )
+            other_metadata = MetaData(schema="other schema")
+            Table(
+                "attached table",
+                other_metadata,
+                schema="other schema",
+                autoload_with=source_engine,
+            )
+
+            with target_engine.begin() as conn:
+                main_metadata.create_all(conn)
+                attach_path = target_other_path.replace("'", "''")
+                conn.exec_driver_sql(
+                    f"ATTACH DATABASE '{attach_path}' AS \"other schema\""
+                )
+                other_metadata.create_all(conn)
+                eq_(
+                    conn.exec_driver_sql(
+                        "SELECT sql FROM main.sqlite_master "
+                        "WHERE name = 'ix same'"
+                    ).scalar(),
+                    'CREATE INDEX "ix same" ON "attached table" (x)',
+                )
+                eq_(
+                    conn.exec_driver_sql(
+                        'SELECT sql FROM "other schema".sqlite_master '
+                        "WHERE name = 'ix same'"
+                    ).scalar(),
+                    'CREATE INDEX "ix same" ON '
+                    '"attached table" (lower(x))',
+                )
+
+            source_engine.dispose()
+            target_engine.dispose()
+        finally:
+            for path in (main_path, other_path, target_other_path):
+                if os.path.exists(path):
+                    os.remove(path)
+            target_path = main_path + ".target"
+            if os.path.exists(target_path):
+                os.remove(target_path)
+
+    def test_unsupported_index_definition_warning(self, connection):
+        connection.exec_driver_sql("CREATE TABLE unsupported_index (a TEXT)")
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_unsupported ON unsupported_index (lower(a))"
+        )
+
+        def fail_parse(definition):
+            raise ValueError("unsupported index clause")
+
+        with mock.patch.object(
+            sqlite, "_sqlite_parse_index_definition", fail_parse
+        ):
+            with expect_warnings(
+                "Skipped unsupported reflection of index ix_unsupported: "
+                "unsupported index clause"
+            ):
+                eq_(
+                    inspect(connection).get_indexes("unsupported_index"),
+                    [],
+                )
 
 
 class BlankTableNameTest(fixtures.TestBase):
@@ -1340,6 +1620,41 @@ class RawReflectionTest(fixtures.TestBase):
     )
     def test_fk_pattern(self, ddl, expected):
         eq_(self._parse_fk(ddl), expected)
+
+    def test_parse_index_definition(self):
+        eq_(
+            sqlite._sqlite_parse_index_definition(
+                '''CREATE UNIQUE INDEX "i,x" ON "s".[t] (
+                       lower(a),
+                       b COLLATE NOCASE DESC,
+                       'it''s, where (x)'
+                    )
+                    -- predicate
+                    WHERE b <> 'x, where)'
+                '''
+            ),
+            (
+                '"i,x"',
+                "[t]",
+                [
+                    "lower(a)",
+                    "b COLLATE NOCASE DESC",
+                    "'it''s, where (x)'",
+                ],
+                "b <> 'x, where)'",
+            ),
+        )
+
+    @testing.combinations(
+        "CREATE INDEX i ON t (lower(a)",
+        "CREATE INDEX i ON t (lower(a)) WHERE b <> 'x",
+        "CREATE INDEX i ON t (a, )",
+        "CREATE INDEX i ON t (a) EXTRA",
+        argnames="ddl"
+    )
+    def test_parse_index_definition_unsupported(self, ddl):
+        with expect_raises(ValueError):
+            sqlite._sqlite_parse_index_definition(ddl)
 
 
 class TypeReflectionTest(fixtures.TestBase):

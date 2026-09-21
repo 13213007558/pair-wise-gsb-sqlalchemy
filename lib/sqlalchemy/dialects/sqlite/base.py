@@ -2187,6 +2187,309 @@ TABLE_OPTIONS_PATTERN = re.compile(
 )
 
 
+def _sqlite_skip_whitespace_and_comments(definition, pos):
+    length = len(definition)
+    while pos < length:
+        if definition[pos].isspace():
+            pos += 1
+        elif definition.startswith("--", pos):
+            newline = definition.find("\n", pos + 2)
+            if newline == -1:
+                return length
+            pos = newline + 1
+        elif definition.startswith("/*", pos):
+            end = definition.find("*/", pos + 2)
+            if end == -1:
+                raise ValueError("unterminated block comment")
+            pos = end + 2
+        else:
+            break
+    return pos
+
+
+def _sqlite_parse_quoted_identifier(definition, pos):
+    quote = definition[pos]
+    if quote == '"':
+        escape = '"'
+    elif quote == "'":
+        escape = "'"
+    elif quote == "`":
+        escape = "`"
+    else:
+        end = definition.find("]", pos + 1)
+        if end == -1:
+            raise ValueError("unterminated bracket-quoted identifier")
+        while end != -1 and definition.startswith("]]", end):
+            end = definition.find("]", end + 2)
+        if end == -1:
+            raise ValueError("unterminated bracket-quoted identifier")
+        return end + 1
+
+    pos += 1
+    while pos < len(definition):
+        ch = definition[pos]
+        if ch == escape:
+            if pos + 1 < len(definition) and definition[pos + 1] == escape:
+                pos += 2
+                continue
+            return pos + 1
+        pos += 1
+    raise ValueError("unterminated quoted identifier")
+
+
+def _sqlite_parse_identifier(definition, pos):
+    pos = _sqlite_skip_whitespace_and_comments(definition, pos)
+    if pos >= len(definition):
+        raise ValueError("expected identifier")
+
+    if definition[pos] in ('"', "'", "`", "["):
+        return _sqlite_parse_quoted_identifier(definition, pos)
+
+    start = pos
+    while pos < len(definition) and not definition[pos].isspace():
+        ch = definition[pos]
+        if ch in "(),.;`'\"[]":
+            break
+        pos += 1
+    if pos == start:
+        raise ValueError("expected identifier")
+    return pos
+
+
+def _sqlite_is_keyword_at(definition, keyword, pos):
+    end = pos + len(keyword)
+    if definition[pos:end].upper() != keyword:
+        return False
+    if end < len(definition) and (
+        definition[end].isalnum() or definition[end] == "_"
+    ):
+        return False
+    return True
+
+
+def _sqlite_parse_index_definition(definition):
+    pos = _sqlite_skip_whitespace_and_comments(definition, 0)
+    if not _sqlite_is_keyword_at(definition, "CREATE", pos):
+        raise ValueError("expected CREATE keyword")
+    pos = _sqlite_skip_whitespace_and_comments(definition, pos + 6)
+
+    if _sqlite_is_keyword_at(definition, "UNIQUE", pos):
+        pos = _sqlite_skip_whitespace_and_comments(definition, pos + 6)
+
+    if not _sqlite_is_keyword_at(definition, "INDEX", pos):
+        raise ValueError("expected INDEX keyword")
+    pos = _sqlite_skip_whitespace_and_comments(definition, pos + 5)
+
+    if _sqlite_is_keyword_at(definition, "IF", pos):
+        pos = _sqlite_skip_whitespace_and_comments(definition, pos + 2)
+        if not _sqlite_is_keyword_at(definition, "NOT", pos):
+            raise ValueError("expected NOT keyword")
+        pos = _sqlite_skip_whitespace_and_comments(definition, pos + 3)
+        if not _sqlite_is_keyword_at(definition, "EXISTS", pos):
+            raise ValueError("expected EXISTS keyword")
+        pos = _sqlite_skip_whitespace_and_comments(definition, pos + 6)
+
+    index_end = _sqlite_parse_identifier(definition, pos)
+    index_name = definition[pos:index_end].strip()
+    pos = _sqlite_skip_whitespace_and_comments(definition, index_end)
+
+    while pos < len(definition) and definition[pos] == ".":
+        pos = _sqlite_skip_whitespace_and_comments(definition, pos + 1)
+        index_end = _sqlite_parse_identifier(definition, pos)
+        index_name = definition[pos:index_end].strip()
+        pos = _sqlite_skip_whitespace_and_comments(definition, index_end)
+
+    if not _sqlite_is_keyword_at(definition, "ON", pos):
+        raise ValueError("expected ON keyword")
+    pos = _sqlite_skip_whitespace_and_comments(definition, pos + 2)
+
+    table_end = _sqlite_parse_identifier(definition, pos)
+    table_name = definition[pos:table_end].strip()
+    pos = _sqlite_skip_whitespace_and_comments(definition, table_end)
+
+    while pos < len(definition) and definition[pos] == ".":
+        pos = _sqlite_skip_whitespace_and_comments(definition, pos + 1)
+        next_end = _sqlite_parse_identifier(definition, pos)
+        table_name = definition[pos:next_end].strip()
+        pos = _sqlite_skip_whitespace_and_comments(definition, next_end)
+
+    if pos >= len(definition) or definition[pos] != "(":
+        raise ValueError("expected index expression list")
+
+    expressions = []
+    expression_start = pos + 1
+    depth = 1
+    pos += 1
+    predicate = None
+    length = len(definition)
+
+    while pos < length:
+        ch = definition[pos]
+        if ch in ('"', "'", "`", "["):
+            pos = _sqlite_parse_quoted_identifier(definition, pos)
+            continue
+        if definition.startswith("--", pos) or definition.startswith(
+            "/*", pos
+        ):
+            pos = _sqlite_skip_whitespace_and_comments(definition, pos)
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                expression = definition[expression_start:pos].strip()
+                if not expression:
+                    raise ValueError("empty index expression")
+                expressions.append(expression)
+                pos = _sqlite_skip_whitespace_and_comments(
+                    definition, pos + 1
+                )
+                break
+            if depth < 0:
+                raise ValueError("unbalanced parentheses")
+        elif ch == "," and depth == 1:
+            expression = definition[expression_start:pos].strip()
+            if not expression:
+                raise ValueError("empty index expression")
+            expressions.append(expression)
+            expression_start = pos + 1
+        pos += 1
+    else:
+        raise ValueError("unterminated index expression list")
+
+    if pos < length and _sqlite_is_keyword_at(definition, "WHERE", pos):
+        predicate_start = _sqlite_skip_whitespace_and_comments(
+            definition, pos + 5
+        )
+        predicate_end = length
+        predicate_depth = 0
+        pos = predicate_start
+        while pos < length:
+            ch = definition[pos]
+            if ch in ('"', "'", "`", "["):
+                pos = _sqlite_parse_quoted_identifier(definition, pos)
+                continue
+            if definition.startswith("--", pos) or definition.startswith(
+                "/*", pos
+            ):
+                pos = _sqlite_skip_whitespace_and_comments(definition, pos)
+                continue
+            if ch == "(":
+                predicate_depth += 1
+            elif ch == ")":
+                predicate_depth -= 1
+                if predicate_depth < 0:
+                    raise ValueError("unbalanced parentheses")
+            elif ch == ";" and predicate_depth == 0:
+                trailing = _sqlite_skip_whitespace_and_comments(
+                    definition, pos + 1
+                )
+                if trailing < length:
+                    raise ValueError("unexpected data after index definition")
+                predicate_end = pos
+                pos = length
+                break
+            pos += 1
+
+        if predicate_depth:
+            raise ValueError("unterminated parentheses")
+        predicate = definition[predicate_start:predicate_end].strip()
+        if not predicate:
+            raise ValueError("empty partial index predicate")
+        pos = length
+
+    if pos < length:
+        raise ValueError("unexpected data after index definition")
+
+    return index_name, table_name, expressions, predicate
+
+
+def _sqlite_parse_simple_index_key(key):
+    pos = 0
+    pos = _sqlite_skip_whitespace_and_comments(key, pos)
+    identifier_end = _sqlite_parse_identifier(key, pos)
+    pos = identifier_end
+    has_collation = False
+    has_modifiers = False
+    is_desc = False
+    expression_end = identifier_end
+
+    while True:
+        pos = _sqlite_skip_whitespace_and_comments(key, pos)
+        if pos >= len(key):
+            break
+        if key[pos] == "." and not has_collation:
+            pos = _sqlite_skip_whitespace_and_comments(key, pos + 1)
+            identifier_end = _sqlite_parse_identifier(key, pos)
+            expression_end = identifier_end
+            pos = identifier_end
+            continue
+        if _sqlite_is_keyword_at(key, "DESC", pos):
+            pos += 4
+            is_desc = True
+            has_modifiers = True
+            continue
+        if _sqlite_is_keyword_at(key, "ASC", pos):
+            pos += 3
+            has_modifiers = has_collation
+            continue
+        if not _sqlite_is_keyword_at(key, "COLLATE", pos):
+            raise ValueError("unsupported index key modifier")
+
+        pos = _sqlite_skip_whitespace_and_comments(key, pos + 7)
+        pos = _sqlite_parse_identifier(key, pos)
+        has_collation = True
+        has_modifiers = True
+        expression_end = pos
+        pos = _sqlite_skip_whitespace_and_comments(key, pos)
+        if pos >= len(key):
+            break
+        if _sqlite_is_keyword_at(key, "DESC", pos):
+            pos += 4
+            is_desc = True
+        elif _sqlite_is_keyword_at(key, "ASC", pos):
+            pos += 3
+        else:
+            raise ValueError("unsupported index key modifier")
+
+    return (
+        has_modifiers,
+        is_desc,
+        key[:expression_end].strip(),
+    )
+
+
+def _sqlite_split_index_expression_ordering(expression):
+    pos = 0
+    depth = 0
+    while pos < len(expression):
+        ch = expression[pos]
+        if ch in ('"', "'", "`", "["):
+            pos = _sqlite_parse_quoted_identifier(expression, pos)
+            continue
+        if expression.startswith("--", pos) or expression.startswith(
+            "/*", pos
+        ):
+            pos = _sqlite_skip_whitespace_and_comments(expression, pos)
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0 and _sqlite_is_keyword_at(
+            expression, "DESC", pos
+        ):
+            keyword = "desc"
+            trailing = _sqlite_skip_whitespace_and_comments(
+                expression, pos + len(keyword)
+            )
+            if trailing == len(expression):
+                return expression[:pos].strip(), keyword
+        pos += 1
+    return expression.strip(), None
+
+
 class SQLiteDialect(default.DefaultDialect):
     name = "sqlite"
     supports_alter = False
@@ -3008,29 +3311,50 @@ class SQLiteDialect(default.DefaultDialect):
         )
         indexes = []
 
-        # regular expression to extract the filter predicate of a partial
-        # index. this could fail to extract the predicate correctly on
-        # indexes created like
-        #   CREATE INDEX i ON t (col || ') where') WHERE col <> ''
-        # but as this function does not support expression-based indexes
-        # this case does not occur.
-        partial_pred_re = re.compile(r"\)\s+where\s+(.+)", re.IGNORECASE)
-
         if schema:
             schema_expr = "%s." % self.identifier_preparer.quote_identifier(
                 schema
             )
+            index_sql_stmt = (
+                "SELECT sql FROM %(schema)ssqlite_master "
+                "WHERE name = ? AND tbl_name = ? AND type = 'index'"
+                % {"schema": schema_expr}
+            )
         else:
             schema_expr = ""
+            index_sql_stmt = (
+                "SELECT sql FROM "
+                "(SELECT * FROM sqlite_master UNION ALL "
+                "SELECT * FROM sqlite_temp_master) "
+                "WHERE name = ? AND tbl_name = ? AND type = 'index'"
+            )
 
         include_auto_indexes = kw.pop("include_auto_indexes", False)
+        parsed_indexes = {}
         for row in pragma_indexes:
+            is_auto_index = row[1].startswith("sqlite_autoindex")
             # ignore implicit primary key index.
             # https://www.mail-archive.com/sqlite-users@sqlite.org/msg30517.html
-            if not include_auto_indexes and row[1].startswith(
-                "sqlite_autoindex"
-            ):
+            if not include_auto_indexes and is_auto_index:
                 continue
+
+            if not is_auto_index:
+                index_sql = connection.exec_driver_sql(
+                    index_sql_stmt, (row[1], table_name)
+                ).scalar()
+                try:
+                    if index_sql is None:
+                        raise ValueError("index definition was not found")
+                    parsed_indexes[row[1]] = _sqlite_parse_index_definition(
+                        index_sql
+                    )
+                except ValueError as err:
+                    util.warn(
+                        "Skipped unsupported reflection of index %s: %s"
+                        % (row[1], err)
+                    )
+                    continue
+
             indexes.append(
                 dict(
                     name=row[1],
@@ -3040,46 +3364,100 @@ class SQLiteDialect(default.DefaultDialect):
                 )
             )
 
-            # check partial indexes
-            if len(row) >= 5 and row[4]:
-                s = (
-                    "SELECT sql FROM %(schema)ssqlite_master "
-                    "WHERE name = ? "
-                    "AND type = 'index'" % {"schema": schema_expr}
-                )
-                rs = connection.exec_driver_sql(s, (row[1],))
-                index_sql = rs.scalar()
-                predicate_match = partial_pred_re.search(index_sql)
-                if predicate_match is None:
-                    # unless the regex is broken this case shouldn't happen
-                    # because we know this is a partial index, so the
-                    # definition sql should match the regex
-                    util.warn(
-                        "Failed to look up filter predicate of "
-                        "partial index %s" % row[1]
-                    )
-                else:
-                    predicate = predicate_match.group(1)
-                    indexes[-1]["dialect_options"]["sqlite_where"] = text(
-                        predicate
-                    )
-
-        # loop thru unique indexes to get the column names.
+        # loop through the indexes to get the column names.
         for idx in list(indexes):
-            pragma_index = self._get_table_pragma(
-                connection, "index_info", idx["name"], schema=schema
+            pragma_name = (
+                "index_xinfo"
+                if self.server_version_info >= (3, 9)
+                else "index_info"
             )
+            pragma_index = self._get_table_pragma(
+                connection, pragma_name, idx["name"], schema=schema
+            )
+            if pragma_name == "index_xinfo":
+                pragma_index = [row for row in pragma_index if row[5]]
 
-            for row in pragma_index:
-                if row[2] is None:
-                    util.warn(
-                        "Skipped unsupported reflection of "
-                        "expression-based index %s" % idx["name"]
-                    )
-                    indexes.remove(idx)
-                    break
+            if idx["name"] not in parsed_indexes:
+                for row in pragma_index:
+                    if row[2] is None:
+                        util.warn(
+                            "Skipped unsupported reflection of "
+                            "expression-based index %s" % idx["name"]
+                        )
+                        indexes.remove(idx)
+                        break
                 else:
-                    idx["column_names"].append(row[2])
+                    idx["column_names"] = [row[2] for row in pragma_index]
+                continue
+
+            _, _, index_expressions, predicate = parsed_indexes[idx["name"]]
+
+            if len(pragma_index) != len(index_expressions):
+                util.warn(
+                    "Skipped unsupported reflection of index %s: "
+                    "reflected %d index keys but found %d PRAGMA index_info "
+                    "rows"
+                    % (
+                        idx["name"],
+                        len(index_expressions),
+                        len(pragma_index),
+                    )
+                )
+                indexes.remove(idx)
+                continue
+
+            has_expressions = False
+            valid_keys = True
+            expressions = []
+            column_sorting = {}
+            for key, pragma_row in zip(index_expressions, pragma_index):
+                if pragma_row[2] is None:
+                    expression, ordering = (
+                        _sqlite_split_index_expression_ordering(key)
+                    )
+                    is_expression = True
+                    if ordering == "desc":
+                        column_sorting[expression] = ("desc",)
+                else:
+                    try:
+                        (
+                            is_expression,
+                            is_desc,
+                            expression,
+                        ) = _sqlite_parse_simple_index_key(key)
+                    except ValueError as err:
+                        util.warn(
+                            "Skipped unsupported reflection of index %s: %s"
+                            % (idx["name"], err)
+                        )
+                        valid_keys = False
+                        break
+                    if is_desc:
+                        column_sorting[expression] = ("desc",)
+                has_expressions = has_expressions or is_expression
+                expressions.append(expression if is_expression else None)
+                idx["column_names"].append(
+                    None if is_expression else pragma_row[2]
+                )
+
+            if not valid_keys:
+                indexes.remove(idx)
+                continue
+
+            if has_expressions:
+                idx["expressions"] = [
+                    expression if expression is not None else pragma_row[2]
+                    for expression, pragma_row in zip(
+                        expressions, pragma_index
+                    )
+                ]
+            if column_sorting:
+                idx["column_sorting"] = column_sorting
+
+            if predicate is not None:
+                idx["dialect_options"]["sqlite_where"] = text(
+                    predicate
+                )
 
         indexes.sort(key=lambda d: d["name"] or "~")  # sort None as last
         if indexes:

@@ -755,11 +755,11 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def reflect_indexes_with_expressions(self):
-        return only_on(["postgresql", "oracle"])
+        return only_on(["postgresql", "sqlite>=3.9.0", "oracle"])
 
     @property
     def reflect_indexes_with_ascdesc_as_expression(self):
-        return only_on(["oracle"])
+        return only_on(["sqlite", "oracle"])
 
     @property
     def temp_table_names(self):

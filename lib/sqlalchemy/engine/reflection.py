@@ -1899,8 +1899,22 @@ class Inspector(inspection.Inspectable["Inspector"]):
                             "'expressions' were returned"
                         )
                         break
-                    idx_element = sql.text(expressions[index])
+                    expression = expressions[index]
+                    expression_sorting = column_sorting.get(expression, ())
+                    ordering = next(
+                        (
+                            option
+                            for option in expression_sorting
+                            if option in ("asc", "desc")
+                        ),
+                        None,
+                    )
+                    if ordering is not None:
+                        idx_element = sql.text(f"{expression} {ordering}")
+                    else:
+                        idx_element = sql.text(expression)
                 else:
+                    expression = c
                     try:
                         if c in cols_by_orig_name:
                             idx_element = cols_by_orig_name[c]
@@ -1912,7 +1926,8 @@ class Inspector(inspection.Inspectable["Inspector"]):
                             f"columns for table {table.name!r}"
                         )
                         continue
-                    for option in column_sorting.get(c, ()):
+                if c is not None:
+                    for option in column_sorting.get(expression, ()):
                         if option in self._index_sort_exprs:
                             op = self._index_sort_exprs[option]
                             idx_element = op(idx_element)
