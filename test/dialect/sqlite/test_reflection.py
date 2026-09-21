@@ -1660,6 +1660,12 @@ class ComputedReflectionTest(fixtures.TestBase):
             {"x": {"text": "s || 'x'", "stored": False}},
         ),
         (
+            "CREATE TABLE test10 ("
+            "s VARCHAR, x VARCHAR AS (s || 'x'))",
+            "test10",
+            {"x": {"text": "s || 'x'", "stored": False}},
+        ),
+        (
             """CREATE TABLE test_strict1 (
                 s TEXT,
                 x TEXT GENERATED ALWAYS AS (s || 'x')

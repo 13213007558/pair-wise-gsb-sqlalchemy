@@ -2187,6 +2187,195 @@ TABLE_OPTIONS_PATTERN = re.compile(
 )
 
 
+def _consume_sqlite_quote(text, index, quote):
+    """Return the position immediately after a quoted identifier."""
+
+    if quote == "[":
+        end = text.find("]", index + 1)
+        return len(text) if end < 0 else end + 1
+
+    index += 1
+    while index < len(text):
+        if text[index] != quote:
+            index += 1
+        elif index + 1 < len(text) and text[index + 1] == quote:
+            index += 2
+        else:
+            return index + 1
+
+    return len(text)
+
+
+def _extract_sqlite_table_body(table_sql):
+    quote = None
+    depth = 0
+    opening = None
+    index = 0
+    while index < len(table_sql):
+        char = table_sql[index]
+        if quote is not None:
+            next_index = _consume_sqlite_quote(table_sql, index, quote)
+            if next_index > index:
+                quote = None
+                index = next_index
+                continue
+        elif char in ("\"", "'", "`", "["):
+            quote = char
+            index += 1
+            continue
+        elif char == "(":
+            depth += 1
+            if depth == 1 and opening is None:
+                opening = index
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return table_sql[opening + 1 : index]
+
+        index += 1
+
+    return None
+
+
+def _split_sqlite_table_definition(table_sql):
+    """Split a SQLite CREATE TABLE body into column and table constraints.
+
+    SQLite stores the original CREATE TABLE statement verbatim.  Commas can
+    occur inside quoted identifiers, string literals, nested expressions and
+    generated column expressions, so a plain ``str.split(',')`` or regular
+    expression may incorrectly join adjacent column definitions.
+    """
+
+    body = _extract_sqlite_table_body(table_sql)
+    if body is None:
+        return []
+
+    depth = 0
+    quote = None
+    definitions = []
+    start = 0
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if quote is not None:
+            next_index = _consume_sqlite_quote(body, index, quote)
+            if next_index > index:
+                quote = None
+                index = next_index
+            continue
+        elif char in ("\"", "'", "`", "["):
+            quote = char
+            index += 1
+            continue
+
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            definitions.append(body[start:index].strip())
+            start = index + 1
+
+        index += 1
+
+    definitions.append(body[start:].strip())
+    return [definition for definition in definitions if definition]
+
+
+def _parse_sqlite_generated_column(definition):
+    depth = 0
+    quote = None
+    generated = False
+    expression_start = None
+    index = 0
+
+    while index < len(definition):
+        char = definition[index]
+
+        if quote is not None:
+            next_index = _consume_sqlite_quote(definition, index, quote)
+            if next_index > index:
+                quote = None
+                index = next_index
+            continue
+        elif char in ("\"", "'", "`", "["):
+            quote = char
+            index += 1
+            continue
+        elif char == "(":
+            if generated and depth == 0:
+                expression_start = index + 1
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if generated and depth == 0:
+                sqltext = definition[expression_start:index].strip()
+                trailing = definition[index + 1 :].strip().upper()
+                if re.match(r"STORED(?:\s|$)", trailing):
+                    persisted = True
+                elif re.match(r"VIRTUAL(?:\s|$)", trailing):
+                    persisted = False
+                else:
+                    persisted = None
+                return sqltext, persisted
+        elif depth == 0 and not generated:
+            before = definition[index - 1] if index > 0 else " "
+            if before.isalnum() or before == "_":
+                index += 1
+                continue
+            match = re.match(
+                r"(?:GENERATED\s+ALWAYS\s+)?AS(?:\s|$)",
+                definition[index:],
+                re.I,
+            )
+            if match:
+                index += match.end()
+                while index < len(definition) and definition[index].isspace():
+                    index += 1
+                if index < len(definition) and definition[index] == "(":
+                    generated = True
+                    continue
+                return None
+
+        index += 1
+
+    return None
+
+
+def _extract_sqlite_column_name(definition):
+    definition = definition.lstrip()
+    if not definition:
+        return None
+
+    if definition[0] == '"':
+        end = 1
+        chars = []
+        while end < len(definition):
+            char = definition[end]
+            if char == '"':
+                if end + 1 < len(definition) and definition[end + 1] == '"':
+                    chars.append('"')
+                    end += 2
+                    continue
+                return "".join(chars)
+            chars.append(char)
+            end += 1
+    elif definition[0] == "`":
+        end = definition.find("`", 1)
+        if end >= 0:
+            return definition[1:end].replace("``", "`")
+    elif definition[0] == "[":
+        end = definition.find("]", 1)
+        if end >= 0:
+            return definition[1:end]
+    else:
+        match = re.match(r"[^\s(]+", definition)
+        if match:
+            return match.group(0)
+
+    return None
+
+
 class SQLiteDialect(default.DefaultDialect):
     name = "sqlite"
     supports_alter = False
@@ -2275,6 +2464,8 @@ class SQLiteDialect(default.DefaultDialect):
         self.native_datetime = native_datetime
 
         if self.dbapi is not None:
+            self.server_version_info = self.dbapi.sqlite_version_info
+
             if self.dbapi.sqlite_version_info < (3, 7, 16):
                 util.warn(
                     "SQLite version %s is older than 3.7.16, and will not "
@@ -2515,7 +2706,21 @@ class SQLiteDialect(default.DefaultDialect):
             connection, pragma, table_name, schema=schema
         )
         columns = []
-        tablesql = None
+        generated_definitions = {}
+        if pragma == "table_xinfo" and any(
+            pragma_row[6] in (2, 3) for pragma_row in info
+        ):
+            tablesql = self._get_table_sql(
+                connection, table_name, schema, **kw
+            )
+            for definition in _split_sqlite_table_definition(tablesql):
+                column_name = _extract_sqlite_column_name(definition)
+                if (
+                    column_name is not None
+                    and _parse_sqlite_generated_column(definition)
+                ):
+                    generated_definitions[column_name] = definition
+
         for row in info:
             name = row[1]
             type_ = row[2].upper()
@@ -2533,22 +2738,6 @@ class SQLiteDialect(default.DefaultDialect):
             generated = bool(hidden)
             persisted = hidden == 3
 
-            if tablesql is None and generated:
-                tablesql = self._get_table_sql(
-                    connection, table_name, schema, **kw
-                )
-                # remove create table
-                match = re.match(
-                    (
-                        r"create table .*?\((.*)\)"
-                        r"(?:\s*,?\s*(?:WITHOUT\s+ROWID|STRICT))*$"
-                    ),
-                    tablesql.strip(),
-                    re.DOTALL | re.IGNORECASE,
-                )
-                assert match, f"create table not found in {tablesql}"
-                tablesql = match.group(1).strip()
-
             columns.append(
                 self._get_column_info(
                     name,
@@ -2558,7 +2747,8 @@ class SQLiteDialect(default.DefaultDialect):
                     primary_key,
                     generated,
                     persisted,
-                    tablesql,
+                    None,
+                    generated_definitions.get(name),
                 )
             )
         if columns:
@@ -2580,6 +2770,7 @@ class SQLiteDialect(default.DefaultDialect):
         generated,
         persisted,
         tablesql,
+        column_definition=None,
     ):
         if generated:
             # the type of a column "cc INTEGER GENERATED ALWAYS AS (1 + 42)"
@@ -2601,17 +2792,17 @@ class SQLiteDialect(default.DefaultDialect):
         }
         if generated:
             sqltext = ""
-            if tablesql:
-                pattern = (
-                    r"[^,]*\s+GENERATED\s+ALWAYS\s+AS"
-                    r"\s+\((.*)\)\s*(?:virtual|stored)?"
-                )
-                match = re.search(
-                    re.escape(name) + pattern, tablesql, re.IGNORECASE
-                )
-                if match:
-                    sqltext = match.group(1)
-            colspec["computed"] = {"sqltext": sqltext, "persisted": persisted}
+            reflected_persisted = persisted
+            if column_definition is not None:
+                parsed = _parse_sqlite_generated_column(column_definition)
+                if parsed is not None:
+                    sqltext, reflected_persisted = parsed
+                    if reflected_persisted is None:
+                        reflected_persisted = persisted
+            colspec["computed"] = {
+                "sqltext": sqltext,
+                "persisted": reflected_persisted,
+            }
         return colspec
 
     def _resolve_type_affinity(self, type_):
