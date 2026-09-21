@@ -2187,6 +2187,177 @@ TABLE_OPTIONS_PATTERN = re.compile(
 )
 
 
+# tokenizer for the verbatim CREATE INDEX text that sqlite stores in
+# sqlite_master.  string literals, quoted identifiers and comments are
+# kept atomic, so that commas, parentheses or keywords appearing inside
+# them are not mistaken for the structure of the statement itself.
+_SQL_TOKEN_PATTERN = re.compile(
+    r"""
+    (?P<space>\s+)
+    |(?P<comment>--[^\n]*(?:\n|$)|/\*(?:[^*]|\*(?!/))*\*/)
+    |(?P<string>'(?:[^']|'')*')
+    |(?P<qident>"(?:[^"]|"")*"|\x60(?:[^\x60]|\x60\x60)*\x60|\[[^\]]*\])
+    |(?P<word>[A-Za-z_\x80-\xff][\w$\x80-\xff]*)
+    |(?P<punct>.)
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+
+def _tokenize_sql(sql):
+    """Yield (kind, start, end) for each significant token in a SQL
+    string, skipping whitespace and comments."""
+
+    for match in _SQL_TOKEN_PATTERN.finditer(sql):
+        kind = match.lastgroup
+        if kind not in ("space", "comment"):
+            yield kind, match.start(), match.end()
+
+
+def _dequote_identifier(token):
+    """Remove quoting from a quoted identifier token, resolving escaped
+    quotes."""
+
+    if token[:1] in ('"', "\x60"):
+        return token[1:-1].replace(token[0] * 2, token[0])
+    elif token[:1] == "[":
+        return token[1:-1]
+    else:
+        return token
+
+
+def _parse_create_index_sql(sql):
+    """Parse the verbatim CREATE INDEX text that sqlite stores in
+    sqlite_master.
+
+    Returns a tuple (items, where) where items is a list of
+    (text, column_name, descending) tuples, one per index key in
+    order.  column_name is the dequoted column name if the key is a
+    plain column reference, or None if the key is an arbitrary expression,
+    in which case text holds the expression text.  descending is
+    True if a plain column reference carries a DESC suffix.  where is
+    the text of the partial index predicate, or None if the index is not
+    partial.
+
+    Returns None if the statement cannot be parsed reliably; callers
+    should warn and skip the index in that case rather than risk
+    reflecting a definition that would render incorrect DDL.
+    """
+
+    tokens = list(_tokenize_sql(sql))
+
+    # locate the ON keyword that introduces the table name: the first
+    # bare ON keyword outside of any parenthesized section.  the tokens
+    # before it are CREATE [UNIQUE] INDEX [IF NOT EXISTS] and the possibly
+    # schema-qualified, possibly quoted index name.
+    on_index = None
+    depth = 0
+    for i, (kind, start, end) in enumerate(tokens):
+        token_text = sql[start:end]
+        if kind == "punct":
+            if token_text == "(":
+                depth += 1
+            elif token_text == ")":
+                depth -= 1
+                if depth < 0:
+                    return None
+        elif kind == "word" and depth == 0 and token_text.upper() == "ON":
+            on_index = i
+            break
+    if on_index is None:
+        return None
+
+    # the table name follows ON: a possibly schema-qualified, possibly
+    # quoted identifier, then the opening paren of the key list
+    i = on_index + 1
+    if i < len(tokens) and tokens[i][0] in ("word", "qident"):
+        i += 1
+        if (
+            i + 1 < len(tokens)
+            and sql[tokens[i][1] : tokens[i][2]] == "."
+            and tokens[i + 1][0] in ("word", "qident")
+        ):
+            i += 2
+    else:
+        return None
+    if i >= len(tokens) or sql[tokens[i][1] : tokens[i][2]] != "(":
+        return None
+
+    # split the key list at top-level commas, up to the matching close
+    # paren.  commas inside strings, quoted identifiers or nested parens
+    # do not delimit keys.
+    item_start = tokens[i][2]
+    depth = 1
+    items = []
+    close_index = None
+    for j in range(i + 1, len(tokens)):
+        kind, start, end = tokens[j]
+        token_text = sql[start:end]
+        if kind == "punct":
+            if token_text == "(":
+                depth += 1
+            elif token_text == ")":
+                depth -= 1
+                if depth == 0:
+                    items.append(sql[item_start:start])
+                    close_index = j
+                    break
+            elif token_text == "," and depth == 1:
+                items.append(sql[item_start:start])
+                item_start = end
+    if close_index is None:
+        return None
+
+    # only an optional WHERE clause may follow the key list
+    where = None
+    rest = tokens[close_index + 1 :]
+    if rest:
+        kind, start, end = rest[0]
+        if kind == "word" and sql[start:end].upper() == "WHERE":
+            where = sql[end:].strip()
+            if not where:
+                return None
+        else:
+            return None
+
+    parsed_items = []
+    for item in items:
+        item = item.strip()
+        if not item:
+            return None
+        sub_tokens = list(_tokenize_sql(item))
+        if not sub_tokens:
+            return None
+        descending = False
+        kind, start, end = sub_tokens[-1]
+        last_word = item[start:end]
+        if kind == "word" and last_word.upper() in ("ASC", "DESC"):
+            descending = last_word.upper() == "DESC"
+            sub_tokens = sub_tokens[:-1]
+            if not sub_tokens:
+                return None
+        # a COLLATE clause cannot be represented as a plain column
+        # reference; keep the full text as an expression.  anything that
+        # is not a lone identifier is an expression as well; its text is
+        # preserved verbatim, including any ASC/DESC suffix.
+        has_collate = any(
+            kind == "word" and item[start:end].upper() == "COLLATE"
+            for kind, start, end in sub_tokens
+        )
+        if (
+            not has_collate
+            and len(sub_tokens) == 1
+            and sub_tokens[0][0] in ("word", "qident")
+        ):
+            column_name = _dequote_identifier(
+                item[sub_tokens[0][1] : sub_tokens[0][2]]
+            )
+            parsed_items.append((item, column_name, descending))
+        else:
+            parsed_items.append((item, None, False))
+    return parsed_items, where
+
+
 class SQLiteDialect(default.DefaultDialect):
     name = "sqlite"
     supports_alter = False
@@ -3008,14 +3179,6 @@ class SQLiteDialect(default.DefaultDialect):
         )
         indexes = []
 
-        # regular expression to extract the filter predicate of a partial
-        # index. this could fail to extract the predicate correctly on
-        # indexes created like
-        #   CREATE INDEX i ON t (col || ') where') WHERE col <> ''
-        # but as this function does not support expression-based indexes
-        # this case does not occur.
-        partial_pred_re = re.compile(r"\)\s+where\s+(.+)", re.IGNORECASE)
-
         if schema:
             schema_expr = "%s." % self.identifier_preparer.quote_identifier(
                 schema
@@ -3031,55 +3194,101 @@ class SQLiteDialect(default.DefaultDialect):
                 "sqlite_autoindex"
             ):
                 continue
-            indexes.append(
-                dict(
-                    name=row[1],
-                    column_names=[],
-                    unique=row[2],
-                    dialect_options={},
-                )
+
+            index_info = self._get_table_pragma(
+                connection, "index_info", row[1], schema=schema
+            )
+            has_expression = any(
+                info_row[2] is None for info_row in index_info
+            )
+            is_partial = bool(len(row) >= 5 and row[4])
+
+            index = dict(
+                name=row[1],
+                column_names=[],
+                unique=row[2],
+                dialect_options={},
             )
 
-            # check partial indexes
-            if len(row) >= 5 and row[4]:
-                s = (
-                    "SELECT sql FROM %(schema)ssqlite_master "
-                    "WHERE name = ? "
-                    "AND type = 'index'" % {"schema": schema_expr}
-                )
-                rs = connection.exec_driver_sql(s, (row[1],))
-                index_sql = rs.scalar()
-                predicate_match = partial_pred_re.search(index_sql)
-                if predicate_match is None:
-                    # unless the regex is broken this case shouldn't happen
-                    # because we know this is a partial index, so the
-                    # definition sql should match the regex
-                    util.warn(
-                        "Failed to look up filter predicate of "
-                        "partial index %s" % row[1]
-                    )
-                else:
-                    predicate = predicate_match.group(1)
-                    indexes[-1]["dialect_options"]["sqlite_where"] = text(
-                        predicate
-                    )
+            if not has_expression and not is_partial:
+                # plain index on plain columns; the pragma gives
+                # everything needed
+                index["column_names"] = [
+                    info_row[2] for info_row in index_info
+                ]
+                indexes.append(index)
+                continue
 
-        # loop thru unique indexes to get the column names.
-        for idx in list(indexes):
-            pragma_index = self._get_table_pragma(
-                connection, "index_info", idx["name"], schema=schema
+            # expression-based and partial indexes require parsing the
+            # original CREATE INDEX statement, which is looked up in the
+            # sqlite_master table of the schema the index lives in, so
+            # that a same-named index in an attached database is not
+            # picked up by mistake.
+            s = (
+                "SELECT sql FROM %(schema)ssqlite_master "
+                "WHERE name = ? "
+                "AND type = 'index'" % {"schema": schema_expr}
             )
+            index_sql = connection.exec_driver_sql(s, (row[1],)).scalar()
+            parsed = index_sql and _parse_create_index_sql(index_sql)
+            if not parsed:
+                util.warn(
+                    "Failed to parse the CREATE INDEX statement of "
+                    "%sindex %r; the index will not be reflected"
+                    % ("partial " if is_partial else "", row[1])
+                )
+                continue
+            items, where = parsed
+            if len(items) != len(index_info):
+                util.warn(
+                    "Failed to reconcile the parsed CREATE INDEX "
+                    "statement of index %r with PRAGMA index_info; "
+                    "the index will not be reflected" % row[1]
+                )
+                continue
 
-            for row in pragma_index:
-                if row[2] is None:
-                    util.warn(
-                        "Skipped unsupported reflection of "
-                        "expression-based index %s" % idx["name"]
-                    )
-                    indexes.remove(idx)
+            column_names = []
+            expressions = []
+            column_sorting = {}
+            consistent = True
+            for (item_text, column_name, descending), info_row in zip(
+                items, index_info
+            ):
+                if column_name is not None and (
+                    info_row[2] is None
+                    or info_row[2].lower() != column_name.lower()
+                ):
+                    # the parser and the pragma disagree about a plain
+                    # column reference; do not trust the parse
+                    consistent = False
                     break
+                if column_name is not None:
+                    column_names.append(info_row[2])
+                    expressions.append(info_row[2])
+                    if descending:
+                        column_sorting[info_row[2]] = ("desc",)
                 else:
-                    idx["column_names"].append(row[2])
+                    # an expression, or a plain column reference with
+                    # additional semantics such as COLLATE that cannot
+                    # be represented as a column name; keep the text
+                    column_names.append(None)
+                    expressions.append(item_text)
+            if not consistent:
+                util.warn(
+                    "Failed to reconcile the parsed CREATE INDEX "
+                    "statement of index %r with PRAGMA index_info; "
+                    "the index will not be reflected" % row[1]
+                )
+                continue
+
+            index["column_names"] = column_names
+            if any(column_name is None for column_name in column_names):
+                index["expressions"] = expressions
+            if column_sorting:
+                index["column_sorting"] = column_sorting
+            if where is not None:
+                index["dialect_options"]["sqlite_where"] = text(where)
+            indexes.append(index)
 
         indexes.sort(key=lambda d: d["name"] or "~")  # sort None as last
         if indexes:

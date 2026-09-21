@@ -2,6 +2,7 @@
 
 from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
+from sqlalchemy import create_engine
 from sqlalchemy import DDL
 from sqlalchemy import event
 from sqlalchemy import exc
@@ -18,6 +19,7 @@ from sqlalchemy.sql.elements import quoted_name
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import eq_
 from sqlalchemy.testing import expect_raises
+from sqlalchemy.testing import expect_warnings
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import is_
 from sqlalchemy.testing import is_true
@@ -1251,6 +1253,358 @@ class ConstraintReflectionTest(fixtures.TestBase):
                 },
             ],
         )
+
+
+class RawCreateIndexParserTest(fixtures.TestBase):
+    # exercises the CREATE INDEX parser directly, without a database,
+    # the same way as RawReflectionTest exercises the FK regexp
+
+    @testing.combinations(
+        (
+            "CREATE INDEX i ON t (a, b)",
+            ([("a", "a", False), ("b", "b", False)], None),
+        ),
+        (
+            "create unique index i on t (a)",
+            ([("a", "a", False)], None),
+        ),
+        (
+            'CREATE INDEX "my index" ON "my table" (a)',
+            ([("a", "a", False)], None),
+        ),
+        (
+            'CREATE INDEX "sch"."idx" ON "tab" ("a col")',
+            ([('"a col"', "a col", False)], None),
+        ),
+        (
+            "CREATE INDEX i ON t (lower(a), upper(substr(b, 1, 2)))",
+            (
+                [
+                    ("lower(a)", None, False),
+                    ("upper(substr(b, 1, 2))", None, False),
+                ],
+                None,
+            ),
+        ),
+        (
+            "CREATE INDEX i ON t (coalesce(a, 'x,y'), b)",
+            ([("coalesce(a, 'x,y')", None, False), ("b", "b", False)], None),
+        ),
+        (
+            "CREATE INDEX i ON t (a || ') where') WHERE b <> ''",
+            ([("a || ') where'", None, False)], "b <> ''"),
+        ),
+        (
+            "CREATE INDEX i ON t (a DESC, b ASC, c)",
+            (
+                [
+                    ("a DESC", "a", True),
+                    ("b ASC", "b", False),
+                    ("c", "c", False),
+                ],
+                None,
+            ),
+        ),
+        (
+            "CREATE INDEX i ON t (a COLLATE NOCASE)",
+            ([("a COLLATE NOCASE", None, False)], None),
+        ),
+        (
+            "CREATE INDEX i ON t (a) WHERE\n  a <> ''\n  AND b IS NOT NULL",
+            ([("a", "a", False)], "a <> ''\n  AND b IS NOT NULL"),
+        ),
+        (
+            "CREATE INDEX i ON t (a) WHERE b = 'it''s ''where'''",
+            ([("a", "a", False)], "b = 'it''s ''where'''"),
+        ),
+        (
+            # comments do not disturb the structure
+            "CREATE INDEX i ON t (a /*, ( */ , b) -- where\nWHERE a > 0",
+            ([("a /*, ( */", "a", False), ("b", "b", False)], "a > 0"),
+        ),
+        # definitions that cannot be parsed reliably
+        ("nonsense", None),
+        ("CREATE INDEX i ON t (a", None),
+        ("CREATE INDEX i ON t ()", None),
+        ("CREATE INDEX i ON t (a) EXTRA", None),
+        ("CREATE INDEX i ON t (a) WHERE", None),
+        ("CREATE INDEX i ON t (a))", None),
+        ("CREATE INDEX i ON t (a,)", None),
+        argnames="ddl,expected",
+    )
+    def test_parse_create_index_sql(self, ddl, expected):
+        eq_(sqlite._parse_create_index_sql(ddl), expected)
+
+
+class ExpressionIndexReflectionTest(fixtures.TestBase):
+    __only_on__ = "sqlite"
+    __backend__ = True
+
+    def test_plain_index_regression(self, connection):
+        # plain indexes are reflected as before, with no "expressions"
+        # key and no parsing of the CREATE INDEX statement
+        connection.exec_driver_sql("CREATE TABLE t_plain (a INTEGER, b TEXT)")
+        connection.exec_driver_sql("CREATE INDEX ix_plain ON t_plain (a, b)")
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX ux_plain ON t_plain (a)"
+        )
+        eq_(
+            inspect(connection).get_indexes("t_plain"),
+            [
+                {
+                    "unique": 0,
+                    "name": "ix_plain",
+                    "column_names": ["a", "b"],
+                    "dialect_options": {},
+                },
+                {
+                    "unique": 1,
+                    "name": "ux_plain",
+                    "column_names": ["a"],
+                    "dialect_options": {},
+                },
+            ],
+        )
+
+    @testing.requires.indexes_with_expressions
+    def test_reflect_mixed_expressions(self, connection):
+        connection.exec_driver_sql(
+            "CREATE TABLE t_mixed (a TEXT, b INTEGER, c TEXT)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_mixed ON t_mixed (lower(a), b, upper(c))"
+        )
+        eq_(
+            inspect(connection).get_indexes("t_mixed"),
+            [
+                {
+                    "unique": 0,
+                    "name": "ix_mixed",
+                    "column_names": [None, "b", None],
+                    "expressions": ["lower(a)", "b", "upper(c)"],
+                    "dialect_options": {},
+                }
+            ],
+        )
+
+    @testing.requires.indexes_with_expressions
+    def test_reflect_nested_functions_and_strings(self, connection):
+        connection.exec_driver_sql("CREATE TABLE t_nested (a TEXT, b TEXT)")
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_nested ON t_nested "
+            "(coalesce(lower(a), 'x, y'), replace(b, 'it''s', 'is'))"
+        )
+        eq_(
+            inspect(connection).get_indexes("t_nested"),
+            [
+                {
+                    "unique": 0,
+                    "name": "ix_nested",
+                    "column_names": [None, None],
+                    "expressions": [
+                        "coalesce(lower(a), 'x, y')",
+                        "replace(b, 'it''s', 'is')",
+                    ],
+                    "dialect_options": {},
+                }
+            ],
+        )
+
+    @testing.requires.indexes_with_expressions
+    @testing.requires.sqlite_partial_indexes
+    def test_reflect_expression_with_where_like_string(self, connection):
+        connection.exec_driver_sql("CREATE TABLE t_tricky (a TEXT, b TEXT)")
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_tricky ON t_tricky (a || ') where') "
+            "WHERE b <> ''"
+        )
+        eq_(
+            inspect(connection).get_indexes("t_tricky"),
+            [
+                {
+                    "unique": 0,
+                    "name": "ix_tricky",
+                    "column_names": [None],
+                    "expressions": ["a || ') where'"],
+                    "dialect_options": {"sqlite_where": mock.ANY},
+                }
+            ],
+        )
+        eq_(
+            inspect(connection)
+            .get_indexes("t_tricky")[0]["dialect_options"]["sqlite_where"]
+            .text,
+            "b <> ''",
+        )
+
+    @testing.requires.indexes_with_expressions
+    def test_reflect_collate_and_desc(self, connection):
+        connection.exec_driver_sql(
+            "CREATE TABLE t_collate (a TEXT, b INTEGER, c TEXT)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_collate ON t_collate "
+            "(a COLLATE NOCASE, b DESC, lower(c))"
+        )
+        eq_(
+            inspect(connection).get_indexes("t_collate"),
+            [
+                {
+                    "unique": 0,
+                    "name": "ix_collate",
+                    "column_names": [None, "b", None],
+                    "expressions": ["a COLLATE NOCASE", "b", "lower(c)"],
+                    "column_sorting": {"b": ("desc",)},
+                    "dialect_options": {},
+                }
+            ],
+        )
+
+    @testing.requires.sqlite_partial_indexes
+    def test_reflect_multiline_where(self, connection):
+        connection.exec_driver_sql(
+            "CREATE TABLE t_multiline (a INTEGER, b INTEGER)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_multiline ON t_multiline (a)\n"
+            "WHERE a > 10\n"
+            "  AND b < 20"
+        )
+        indexes = inspect(connection).get_indexes("t_multiline")
+        eq_(
+            indexes[0]["dialect_options"]["sqlite_where"].text,
+            "a > 10\n  AND b < 20",
+        )
+
+    @testing.requires.indexes_with_expressions
+    def test_reflect_quoted_names(self, connection):
+        connection.exec_driver_sql(
+            'CREATE TABLE "my table" ("a col" TEXT, b TEXT)'
+        )
+        connection.exec_driver_sql(
+            'CREATE INDEX "my index" ON "my table" (lower("a col"), b)'
+        )
+        eq_(
+            inspect(connection).get_indexes("my table"),
+            [
+                {
+                    "unique": 0,
+                    "name": "my index",
+                    "column_names": [None, "b"],
+                    "expressions": ['lower("a col")', "b"],
+                    "dialect_options": {},
+                }
+            ],
+        )
+
+    @testing.requires.indexes_with_expressions
+    def test_reflect_attached_schema_isolation(self, connection):
+        # a same-named index in an attached database must not leak
+        # into the reflection of the main schema, and vice versa
+        connection.exec_driver_sql("CREATE TABLE t_attach (a TEXT)")
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_same ON t_attach (lower(a))"
+        )
+        connection.exec_driver_sql("ATTACH DATABASE ':memory:' AS aux")
+        try:
+            connection.exec_driver_sql(
+                "CREATE TABLE aux.t_attach (a TEXT, b TEXT)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX aux.ix_same ON t_attach (upper(a), b)"
+            )
+            main_indexes = inspect(connection).get_indexes("t_attach")
+            aux_indexes = inspect(connection).get_indexes(
+                "t_attach", schema="aux"
+            )
+        finally:
+            connection.exec_driver_sql("DETACH DATABASE aux")
+        eq_(main_indexes[0]["expressions"], ["lower(a)"])
+        eq_(aux_indexes[0]["expressions"], ["upper(a)", "b"])
+
+    @testing.requires.sqlite_partial_indexes
+    def test_unparseable_definition_warns_and_skips(self, connection):
+        connection.exec_driver_sql(
+            "CREATE TABLE t_broken (a INTEGER, b INTEGER)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_broken ON t_broken (a) WHERE b > 5"
+        )
+        connection.exec_driver_sql("CREATE INDEX ix_ok ON t_broken (a)")
+        with mock.patch.object(
+            sqlite, "_parse_create_index_sql", return_value=None
+        ):
+            with expect_warnings(
+                "Failed to parse the CREATE INDEX statement of "
+                "partial index 'ix_broken'"
+            ):
+                indexes = inspect(connection).get_indexes("t_broken")
+        # the unparseable index is skipped rather than reflected with
+        # a definition that would render incorrect DDL
+        eq_(
+            indexes,
+            [
+                {
+                    "unique": 0,
+                    "name": "ix_ok",
+                    "column_names": ["a"],
+                    "dialect_options": {},
+                }
+            ],
+        )
+
+    @testing.requires.indexes_with_expressions
+    def test_roundtrip_expression_index_recreates_and_enforces(
+        self, connection
+    ):
+        connection.exec_driver_sql("CREATE TABLE t_rt (a TEXT, b INTEGER)")
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX ux_expr ON t_rt (lower(a), b DESC)"
+        )
+        expected_indexes = inspect(connection).get_indexes("t_rt")
+        metadata = MetaData()
+        t_rt = Table("t_rt", metadata, autoload_with=connection)
+
+        # rebuild the reflected schema in an empty database
+        fresh_engine = create_engine("sqlite://")
+        with fresh_engine.begin() as fresh_conn:
+            metadata.create_all(fresh_conn)
+            eq_(
+                inspect(fresh_conn).get_indexes("t_rt"),
+                expected_indexes,
+            )
+            # uniqueness applies to the expression, not the raw value
+            fresh_conn.execute(t_rt.insert().values(a="Foo", b=1))
+            with expect_raises(exc.IntegrityError):
+                fresh_conn.execute(t_rt.insert().values(a="fOO", b=1))
+            # a different b makes the compound key distinct
+            fresh_conn.execute(t_rt.insert().values(a="fOO", b=2))
+
+    @testing.requires.sqlite_partial_indexes
+    def test_roundtrip_partial_index_filter_preserved(self, connection):
+        connection.exec_driver_sql("CREATE TABLE t_rp (a TEXT, b INTEGER)")
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX ux_partial ON t_rp (a) WHERE b > 10"
+        )
+        metadata = MetaData()
+        t_rp = Table("t_rp", metadata, autoload_with=connection)
+
+        # rebuild the reflected schema in an empty database
+        fresh_engine = create_engine("sqlite://")
+        with fresh_engine.begin() as fresh_conn:
+            metadata.create_all(fresh_conn)
+            reflected = inspect(fresh_conn).get_indexes("t_rp")
+            eq_(
+                reflected[0]["dialect_options"]["sqlite_where"].text,
+                "b > 10",
+            )
+            # rows outside the predicate may repeat
+            fresh_conn.execute(t_rp.insert().values(a="dup", b=5))
+            fresh_conn.execute(t_rp.insert().values(a="dup", b=6))
+            # rows inside the predicate may not
+            fresh_conn.execute(t_rp.insert().values(a="dup", b=20))
+            with expect_raises(exc.IntegrityError):
+                fresh_conn.execute(t_rp.insert().values(a="dup", b=30))
 
 
 class RawReflectionTest(fixtures.TestBase):

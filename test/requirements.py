@@ -755,7 +755,7 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def reflect_indexes_with_expressions(self):
-        return only_on(["postgresql", "oracle"])
+        return only_on(["postgresql", "oracle", "sqlite>=3.9.0"])
 
     @property
     def reflect_indexes_with_ascdesc_as_expression(self):
