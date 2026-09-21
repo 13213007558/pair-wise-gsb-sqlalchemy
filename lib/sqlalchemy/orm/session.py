@@ -1330,11 +1330,19 @@ class SessionTransaction(_StateChange, TransactionalContext):
                 self._prepare_impl()
 
         if self._parent is None or self.nested:
-            for conn, trans, should_commit, autoclose in set(
-                self._connections.values()
-            ):
-                if should_commit:
-                    trans.commit()
+            try:
+                for conn, trans, should_commit, autoclose in set(
+                    self._connections.values()
+                ):
+                    if should_commit:
+                        trans.commit()
+            except:
+                with util.safe_reraise():
+                    with self._expect_state(SessionTransactionState.CLOSED):
+                        self.rollback()
+
+                self._state = SessionTransactionState.CLOSED
+                return
 
             self._state = SessionTransactionState.COMMITTED
             self.session.dispatch.after_commit(self.session)

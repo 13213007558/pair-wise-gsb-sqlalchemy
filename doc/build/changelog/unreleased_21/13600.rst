@@ -1,0 +1,10 @@
+.. change::
+    :tags: bug, orm
+    :tickets: 13600
+
+    Fixed issue where an exception raised while committing the database
+    transaction inside :meth:`_orm.Session.commit` could leave the ORM
+    transaction in the ``PREPARED`` state. The session now rolls back and
+    restores its snapshot when the database ``COMMIT`` or savepoint release
+    fails, allowing the session to be closed or reused consistently with the
+    flush-failure recovery path.

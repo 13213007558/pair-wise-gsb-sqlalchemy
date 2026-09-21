@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy import Sequence
 from sqlalchemy import String
 from sqlalchemy import testing
+from sqlalchemy import text
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_object_session
 from sqlalchemy.ext.asyncio import async_scoped_session
@@ -22,6 +23,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.asyncio import close_all_sessions
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.ext.asyncio import exc as async_exc
 from sqlalchemy.ext.asyncio.base import ReversibleProxy
 from sqlalchemy.orm import DeclarativeBase
@@ -35,6 +38,7 @@ from sqlalchemy.testing import async_test
 from sqlalchemy.testing import config
 from sqlalchemy.testing import engines
 from sqlalchemy.testing import eq_
+from sqlalchemy.testing import expect_raises
 from sqlalchemy.testing import expect_raises_message
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import is_
@@ -632,6 +636,156 @@ class AsyncSessionQueryTest(AsyncFixture):
 
 class AsyncSessionTransactionTest(AsyncFixture):
     run_inserts = None
+
+    def _sqlite_engine(self):
+        return create_async_engine(
+            "sqlite+aiosqlite:///async_session_transaction.db",
+            poolclass=StaticPool,
+        )
+
+    @async_test
+    async def test_nested_flush_failure_recovers_outer(self):
+        class Base(DeclarativeBase):
+            pass
+
+        class User(Base):
+            __tablename__ = "users"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            name: Mapped[str] = mapped_column(unique=True)
+            addresses: Mapped[list["Address"]] = relationship(
+                back_populates="user", cascade="all, delete-orphan"
+            )
+
+        class Address(Base):
+            __tablename__ = "addresses"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            email_address: Mapped[str] = mapped_column(unique=True)
+            user_id: Mapped[int] = mapped_column(
+                ForeignKey("users.id")
+            )
+            user: Mapped[User] = relationship(back_populates="addresses")
+
+        engine = self._sqlite_engine()
+
+        @event.listens_for(engine.sync_engine, "connect")
+        def connect(dbapi_connection, connection_record):
+            dbapi_connection.isolation_level = None
+
+        @event.listens_for(engine.sync_engine, "begin")
+        def begin(connection):
+            connection.exec_driver_sql("BEGIN")
+
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        async with AsyncSession(engine) as session:
+            existing = User(
+                name="ed", addresses=[Address(email_address="ed")]
+            )
+            session.add(existing)
+            await session.commit()
+
+            savepoint = await session.begin_nested()
+            first = User(
+                name="first",
+                addresses=[Address(email_address="first")],
+            )
+            second = User(
+                name="second",
+                addresses=[Address(email_address="second")],
+            )
+            session.add(first)
+            await session.flush()
+            session.add(second)
+            await session.flush()
+            session.add(
+                User(name="bad", addresses=[Address(email_address="ed")])
+            )
+
+            with expect_raises(exc.IntegrityError):
+                await session.flush()
+
+            sync_root = savepoint.sync_transaction.parent
+            eq_(savepoint.sync_transaction._state.name, "DEACTIVE")
+            eq_(sync_root._state.name, "ACTIVE")
+            is_(session.sync_session.get_nested_transaction()._state.name, "DEACTIVE")
+            assert first not in session
+            assert second not in session
+            assert existing in session
+
+            await savepoint.rollback()
+
+            is_(session.get_nested_transaction(), None)
+            is_(session.sync_session.get_transaction(), sync_root)
+            eq_(sync_root._state.name, "ACTIVE")
+            eq_(
+                (await session.scalars(text("select name from users"))).all(),
+                ["ed"],
+            )
+
+            session.add(
+                User(
+                    name="recovered",
+                    addresses=[Address(email_address="recovered")],
+                )
+            )
+            await session.commit()
+            eq_(
+                (
+                    await session.scalars(
+                        text("select name from users order by id")
+                    )
+                ).all(),
+                ["ed", "recovered"],
+            )
+
+        await engine.dispose()
+
+    @testing.combinations((True,), (False,), argnames="expire_on_commit")
+    @async_test
+    async def test_final_commit_failure_rolls_back(
+        self, expire_on_commit
+    ):
+        class Base(DeclarativeBase):
+            pass
+
+        class User(Base):
+            __tablename__ = "users"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            name: Mapped[str]
+
+        engine = self._sqlite_engine()
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        session = AsyncSession(
+            engine, expire_on_commit=expire_on_commit
+        )
+        user = User(name="ed")
+        session.add(user)
+
+        @event.listens_for(engine.sync_engine, "commit")
+        def fail_commit(connection):
+            raise RuntimeError("commit failed")
+
+        with expect_raises_message(RuntimeError, "commit failed"):
+            await session.commit()
+
+        is_(session.sync_session.get_transaction(), None)
+        is_true(session.is_active)
+        assert user not in session
+        eq_(session.identity_map.all_states(), [])
+
+        await session.close()
+        async with AsyncSession(engine) as new_session:
+            eq_(
+                (await new_session.scalars(text("select name from users"))).all(),
+                [],
+            )
+        await engine.dispose()
 
     @async_test
     async def test_interrupt_ctxmanager_connection(

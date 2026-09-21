@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import event
 from sqlalchemy import exc as sa_exc
+from sqlalchemy import ForeignKey
 from sqlalchemy import func
 from sqlalchemy import inspect
 from sqlalchemy import Integer
@@ -17,10 +18,12 @@ from sqlalchemy import String
 from sqlalchemy import Table
 from sqlalchemy import testing
 from sqlalchemy import text
+from sqlalchemy import UniqueConstraint
 from sqlalchemy.orm import attributes
 from sqlalchemy.orm import clear_mappers
 from sqlalchemy.orm import exc as orm_exc
 from sqlalchemy.orm import relationship
+from sqlalchemy.orm import registry as _registry
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import session as _session
 from sqlalchemy.orm import sessionmaker
@@ -1639,6 +1642,412 @@ class RollbackRecoverTest(_LocalFixture):
                 )
             ],
         )
+
+
+class FlushFailureTransactionTest(fixtures.TestBase):
+    @classmethod
+    def setup_class(cls):
+        cls.metadata = MetaData()
+        cls.users = Table(
+            "users",
+            cls.metadata,
+            Column("id", Integer, primary_key=True),
+            Column("name", String(30), nullable=False),
+            UniqueConstraint("name"),
+        )
+        cls.addresses = Table(
+            "addresses",
+            cls.metadata,
+            Column("id", Integer, primary_key=True),
+            Column(
+                "user_id",
+                Integer,
+                ForeignKey("users.id"),
+                nullable=False,
+            ),
+            Column("email_address", String(50), nullable=False),
+            UniqueConstraint("email_address"),
+        )
+
+        class User:
+            pass
+
+        class Address:
+            pass
+
+        cls.User = User
+        cls.Address = Address
+        cls._mapper_registry = _registry()
+        cls._mapper_registry.map_imperatively(
+            User,
+            cls.users,
+            properties={
+                "addresses": relationship(
+                    Address,
+                    back_populates="user",
+                    cascade="all, delete-orphan",
+                    order_by=cls.addresses.c.id,
+                )
+            },
+        )
+        cls._mapper_registry.map_imperatively(
+            Address,
+            cls.addresses,
+            properties={"user": relationship(User, back_populates="addresses")},
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        cls._mapper_registry.dispose()
+
+    def _engine(self, savepoints=False):
+        engine = engines.testing_engine(
+            options={"sqlite_savepoint": savepoints}
+        )
+        self.metadata.create_all(engine)
+        return engine
+
+    def _sql(self):
+        statements = []
+
+        def before_cursor_execute(
+            conn, cursor, statement, parameters, context, executemany
+        ):
+            statements.append(statement)
+
+        return statements, before_cursor_execute
+
+    def _events(self, session):
+        canary = []
+
+        def listen(name):
+            def go(*arg):
+                canary.append(name)
+
+            event.listen(session, name, go)
+
+        for name in (
+            "after_transaction_create",
+            "after_transaction_end",
+            "before_commit",
+            "after_commit",
+            "after_rollback",
+            "after_soft_rollback",
+            "before_flush",
+            "after_flush",
+            "after_flush_postexec",
+        ):
+            listen(name)
+        return canary
+
+    def test_outer_flush_failure(self):
+        User, Address = type(self).User, type(self).Address
+        engine = self._engine()
+        session = Session(engine)
+        canary = self._events(session)
+
+        existing_address = Address(email_address="ed")
+        user = User(id=1, name="ed", addresses=[existing_address])
+        session.add(user)
+        session.commit()
+        canary.clear()
+
+        duplicate_address = Address(email_address="ed")
+        duplicate = User(name="dupe", addresses=[duplicate_address])
+        session.add(duplicate)
+        failure_index = len(canary)
+
+        with expect_raises(sa_exc.IntegrityError):
+            session.flush()
+        failure_events = canary[failure_index:]
+
+        is_(session.is_active, False)
+        is_(session.get_nested_transaction(), None)
+        eq_(session.get_transaction()._state, _session.DEACTIVE)
+        assert duplicate not in session
+        assert duplicate_address not in session
+        assert user in session
+        assert existing_address in session
+        eq_(
+            {
+                state.mapper.class_
+                for state in session.identity_map.all_states()
+            },
+            {User, Address},
+        )
+
+        explicit_rollback_index = len(canary)
+        session.rollback()
+        rollback_events = canary[explicit_rollback_index:]
+
+        is_(session.get_transaction(), None)
+        eq_(
+            session.execute(text("select name from users")).all(),
+            [("ed",)],
+        )
+        eq_(
+            session.execute(
+                text("select email_address from addresses")
+            ).all(),
+            [("ed",)],
+        )
+
+        recovered = User(
+            name="recovered", addresses=[Address(email_address="recovered")]
+        )
+        session.add(recovered)
+        session.commit()
+
+        eq_(
+            session.execute(text("select name from users order by id")).all(),
+            [("ed",), ("recovered",)],
+        )
+        eq_(
+            session.execute(
+                text("select email_address from addresses order by id")
+            ).all(),
+            [("ed",), ("recovered",)],
+        )
+        eq_(
+            failure_events,
+            [
+                "before_flush",
+                "after_transaction_create",
+                "after_rollback",
+                "after_transaction_end",
+                "after_soft_rollback",
+            ],
+        )
+        eq_(
+            rollback_events,
+            [
+                "after_transaction_end",
+                "after_soft_rollback",
+            ],
+        )
+        session.close()
+        engine.dispose()
+
+    @testing.combinations((True,), (False,), argnames="nested")
+    def test_close_and_reuse_after_flush_failure(self, nested):
+        User, Address = type(self).User, type(self).Address
+        engine = self._engine(savepoints=nested)
+        statements, listen = self._sql()
+        event.listen(engine, "before_cursor_execute", listen)
+
+        session = Session(engine)
+        existing = User(name="ed", addresses=[Address(email_address="ed")])
+        session.add(existing)
+        session.commit()
+        statements.clear()
+
+        savepoint = None
+        if nested:
+            savepoint = session.begin_nested()
+        session.add(User(name="bad", addresses=[Address(email_address="ed")]))
+        with expect_raises(sa_exc.IntegrityError):
+            session.flush()
+
+        sql_after_failure = list(statements)
+        if nested:
+            savepoint.rollback()
+        session.close()
+        eq_(statements, sql_after_failure)
+        is_(session.get_transaction(), None)
+        eq_(session.identity_map.all_states(), [])
+
+        recovered = User(
+            name="recovered", addresses=[Address(email_address="recovered")]
+        )
+        session.add(recovered)
+        session.commit()
+        session.close()
+
+        with Session(engine) as new_session:
+            eq_(
+                new_session.execute(
+                    text("select name from users order by id")
+                ).all(),
+                [("ed",), ("recovered",)],
+            )
+        engine.dispose()
+
+    @testing.combinations((True,), (False,), argnames="autoflush")
+    def test_nested_flush_failure_recovers_outer(self, autoflush):
+        User, Address = type(self).User, type(self).Address
+        engine = self._engine(savepoints=True)
+        statements, before_cursor_execute = self._sql()
+        event.listen(engine, "before_cursor_execute", before_cursor_execute)
+        session = Session(engine, autoflush=autoflush)
+        canary = self._events(session)
+
+        existing_address = Address(email_address="ed")
+        existing = User(id=1, name="ed", addresses=[existing_address])
+        session.add(existing)
+        session.commit()
+
+        savepoint = session.begin_nested()
+        first_address = Address(email_address="first")
+        first = User(name="first", addresses=[first_address])
+        second_address = Address(email_address="second")
+        second = User(
+            name="second", addresses=[second_address]
+        )
+        session.add(first)
+        session.flush()
+        session.add(second)
+        session.flush()
+        session.add(
+            User(
+                name="dupe", addresses=[Address(email_address="ed")]
+            )
+        )
+
+        with expect_raises(sa_exc.IntegrityError):
+            if autoflush:
+                session.execute(text("select id from users"))
+            else:
+                session.flush()
+        failure_sql = list(statements)
+        failure_state_sql = list(statements)
+        failure_events = list(canary)
+
+        eq_(savepoint.parent._state, _session.ACTIVE)
+        eq_(savepoint._state, _session.DEACTIVE)
+        is_(session.get_nested_transaction(), savepoint)
+        is_(session.is_active, False)
+        assert first not in session
+        assert second not in session
+        assert first_address not in session
+        assert second_address not in session
+        assert existing in session
+        assert existing_address in session
+        eq_(statements, failure_state_sql)
+
+        savepoint.rollback()
+        eq_(statements[len(failure_sql) :], [])
+        assert failure_sql[-1] == "ROLLBACK TO SAVEPOINT sa_savepoint_1"
+        rollback_events = canary[len(failure_events) :]
+
+        is_(session.get_nested_transaction(), None)
+        root = savepoint.parent
+        is_(session.get_transaction(), root)
+        eq_(root._state, _session.ACTIVE)
+        is_(session.is_active, True)
+        eq_(statements, failure_state_sql)
+        eq_(
+            failure_events[-5:],
+            [
+                "before_flush",
+                "after_transaction_create",
+                "after_rollback",
+                "after_transaction_end",
+                "after_soft_rollback",
+            ],
+        )
+        eq_(
+            rollback_events,
+            ["after_transaction_end", "after_soft_rollback"],
+        )
+        eq_(
+            session.execute(text("select name from users")).all(),
+            [("ed",)],
+        )
+        eq_(
+            session.execute(
+                text("select email_address from addresses")
+            ).all(),
+            [("ed",)],
+        )
+
+        recovered = User(
+            name="recovered", addresses=[Address(email_address="recovered")]
+        )
+        session.add(recovered)
+        session.commit()
+        eq_(
+            session.execute(text("select name from users order by id")).all(),
+            [("ed",), ("recovered",)],
+        )
+        session.close()
+        engine.dispose()
+
+    @testing.combinations((True,), (False,), argnames="expire_on_commit")
+    def test_final_commit_failure_rolls_back(self, expire_on_commit):
+        User, Address = type(self).User, type(self).Address
+        engine = self._engine()
+        session = Session(engine, expire_on_commit=expire_on_commit)
+        canary = self._events(session)
+
+        address = Address(email_address="ed")
+        user = User(name="ed", addresses=[address])
+        session.add(user)
+
+        @event.listens_for(engine, "commit")
+        def fail_commit(connection):
+            raise RuntimeError("commit failed")
+
+        with expect_raises_message(RuntimeError, "commit failed"):
+            session.commit()
+
+        is_(session.get_transaction(), None)
+        is_(session.is_active, True)
+        assert user not in session
+        assert address not in session
+        eq_(session.identity_map.all_states(), [])
+        eq_(canary.count("after_commit"), 0)
+        eq_(
+            canary[-3:],
+            ["after_rollback", "after_transaction_end", "after_soft_rollback"],
+        )
+
+        session.close()
+        with Session(engine) as new_session:
+            eq_(
+                new_session.execute(text("select name from users")).all(),
+                [],
+            )
+        engine.dispose()
+
+    def test_nested_commit_failure_rolls_back_savepoint(self):
+        User, Address = type(self).User, type(self).Address
+        engine = self._engine(savepoints=True)
+        session = Session(engine)
+
+        session.add(User(name="outer", addresses=[Address(email_address="outer")]))
+        session.commit()
+
+        savepoint = session.begin_nested()
+        address = Address(email_address="nested")
+        user = User(name="nested", addresses=[address])
+        session.add(user)
+        session.flush()
+
+        real_release_savepoint = engine.dialect.do_release_savepoint
+
+        def fail_release_savepoint(connection, name):
+            real_release_savepoint(connection, f"{name}_does_not_exist")
+
+        with mock.patch.object(
+            engine.dialect,
+            "do_release_savepoint",
+            fail_release_savepoint,
+        ), expect_raises(sa_exc.DatabaseError):
+            savepoint.commit()
+
+        is_(session.get_nested_transaction(), None)
+        eq_(savepoint.parent._state, _session.ACTIVE)
+        assert user not in session
+        assert address not in session
+
+        session.rollback()
+        session.close()
+        with Session(engine) as new_session:
+            eq_(
+                new_session.execute(text("select name from users")).all(),
+                [("outer",)],
+            )
+        engine.dispose()
 
 
 class SavepointTest(_LocalFixture):
