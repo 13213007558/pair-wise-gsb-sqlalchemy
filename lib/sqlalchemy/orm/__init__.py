@@ -78,6 +78,8 @@ from .events import InstrumentationEvents as InstrumentationEvents
 from .events import MapperEvents as MapperEvents
 from .events import QueryEvents as QueryEvents
 from .events import SessionEvents as SessionEvents
+from .exc import GraphBudgetExceeded as GraphBudgetExceeded
+from .graph import GraphBudget as GraphBudget
 from .identity import IdentityMap as IdentityMap
 from .instrumentation import ClassManager as ClassManager
 from .interfaces import EXT_CONTINUE as EXT_CONTINUE

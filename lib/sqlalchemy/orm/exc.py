@@ -174,6 +174,21 @@ class UnmappedColumnError(sa_exc.InvalidRequestError):
     """Mapping operation was requested on an unknown column."""
 
 
+class GraphBudgetExceeded(sa_exc.InvalidRequestError):
+    """An ORM object graph load exceeded a configured :class:`.GraphBudget`.
+
+    The exception is raised *before* the next SQL statement would have been
+    emitted or before the next distinct entity identity would have been
+    materialized, so that already-loaded objects stay intact in the
+    :class:`.Session` identity map while no further database work occurs.
+
+    .. versionadded:: 2.0.44
+
+    """
+
+    code = "gbb1"
+
+
 class LoaderStrategyException(sa_exc.InvalidRequestError):
     """A loader strategy for an attribute does not exist."""
 

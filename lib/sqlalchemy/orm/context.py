@@ -125,6 +125,8 @@ class QueryContext:
         "yield_per",
         "loaders_require_buffering",
         "loaders_require_uniquing",
+        "graph_budget",
+        "selectin_chunk_size",
     )
 
     runid: int
@@ -210,6 +212,18 @@ class QueryContext:
         self.refresh_state = load_options._refresh_state
         self.yield_per = load_options._yield_per
         self.identity_token = load_options._identity_token
+
+        # graph-loader configuration is merged into execution options in
+        # ORMCompileState.orm_pre_session_exec() (also from statement-level
+        # options) and propagates to nested post-load contexts through the
+        # top-level context merge.  Post loaders always read these off the
+        # top-level context.
+        self.graph_budget = self.execution_options.get(
+            "orm_graph_budget", None
+        )
+        self.selectin_chunk_size = self.execution_options.get(
+            "orm_selectin_chunk_size", None
+        )
 
     def _get_top_level_context(self) -> QueryContext:
         return self.top_level_context or self
@@ -515,6 +529,26 @@ class ORMCompileState(AbstractORMCompileState):
             execution_options,
             statement._execution_options,
         )
+
+        # ORM graph-loader configuration may be set directly on the
+        # statement via Select.execution_options(); make it available on
+        # the execution options of the top-level context, where post load
+        # loaders read it from.  Explicit execute() options take precedence.
+        for _graph_opt_key in (
+            "orm_graph_budget",
+            "orm_selectin_chunk_size",
+        ):
+            if (
+                _graph_opt_key not in execution_options
+                and _graph_opt_key in statement._execution_options
+            ):
+                execution_options = execution_options.union(
+                    {
+                        _graph_opt_key: statement._execution_options[
+                            _graph_opt_key
+                        ]
+                    }
+                )
 
         # default execution options for ORM results:
         # 1. _result_disable_adapt_to_context=True

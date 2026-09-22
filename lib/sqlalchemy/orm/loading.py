@@ -1095,6 +1095,13 @@ def _instance_processor(
                 currentload = not isnew
                 loaded_instance = False
 
+                if isnew:
+                    graph_budget = (
+                        context._get_top_level_context().graph_budget
+                    )
+                    if graph_budget is not None:
+                        graph_budget.charge_identity(state.key)
+
                 if version_check and version_id_getter and not currentload:
                     _validate_version_id(
                         mapper, state, dict_, row, version_id_getter
@@ -1107,6 +1114,10 @@ def _instance_processor(
                 # else no entity is returned for the row
                 if is_not_primary_key(identitykey[1]):
                     return None
+
+                graph_budget = context._get_top_level_context().graph_budget
+                if graph_budget is not None:
+                    graph_budget.charge_identity(identitykey)
 
                 isnew = True
                 currentload = True
@@ -1310,17 +1321,53 @@ def _load_subclass_via_in(
         if context.populate_existing:
             q2 = q2.execution_options(populate_existing=True)
 
+        top_level = context._get_top_level_context()
+        chunk_size = (
+            top_level.selectin_chunk_size or SelectInLoader._chunksize
+        )
+        if (
+            not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
+            or chunk_size < 1
+        ):
+            raise sa_exc.ArgumentError(
+                "selectinload chunk_size must be a positive integer, got "
+                f"{chunk_size!r}"
+            )
+        budget = top_level.graph_budget
+        num_pk_cols = len(mapper.base_mapper.primary_key)
+
+        if budget is not None and budget.max_parameters is not None:
+            max_fit = budget.max_parameters // num_pk_cols
+            if max_fit < 1:
+                raise orm_exc.GraphBudgetExceeded(
+                    "Graph budget exceeded: a selectin polymorphic load for "
+                    "%s requires at least %d bound parameter(s) per parent "
+                    "identity, but max_parameters=%d"
+                    % (mapper, num_pk_cols, budget.max_parameters)
+                )
+            if (
+                top_level.selectin_chunk_size is None
+                and chunk_size > max_fit
+            ):
+                chunk_size = max_fit
+
         while states:
-            chunk = states[0 : SelectInLoader._chunksize]
-            states = states[SelectInLoader._chunksize :]
+            chunk = states[0:chunk_size]
+            states = states[chunk_size:]
+
+            primary_keys = [
+                state.key[1][0] if zero_idx else state.key[1]
+                for state, load_attrs in chunk
+            ]
+
+            if budget is not None:
+                budget.charge_statement(
+                    len(primary_keys) * num_pk_cols
+                )
             context.session.execute(
                 q2,
-                dict(
-                    primary_keys=[
-                        state.key[1][0] if zero_idx else state.key[1]
-                        for state, load_attrs in chunk
-                    ]
-                ),
+                dict(primary_keys=primary_keys),
             ).unique().scalars().all()
 
     return do_load

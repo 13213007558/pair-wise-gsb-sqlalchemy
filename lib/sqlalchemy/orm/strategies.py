@@ -42,6 +42,7 @@ from .context import _column_descriptions
 from .context import ORMCompileState
 from .context import ORMSelectCompileState
 from .context import QueryContext
+from .graph import GraphBudget
 from .interfaces import LoaderStrategy
 from .interfaces import StrategizedProperty
 from .session import _state_session
@@ -2961,6 +2962,88 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
 
     _chunksize = 500
 
+    @staticmethod
+    def _get_graph_budget(context) -> Optional[GraphBudget]:
+        return context._get_top_level_context().graph_budget
+
+    def _resolve_chunking(self, context, loadopt, query_info):
+        """Return (chunk_size, budget, num_pk_cols) for one post load.
+
+        Resolution order for the chunk size: per-loader
+        ``selectinload(..., chunk_size=...)`` option, then the
+        ``orm_selectin_chunk_size`` execution option of the top-level
+        execution, then the built-in default.
+
+        """
+        num_pk_cols = len(query_info.pk_cols)
+
+        chunk_size: Optional[int] = None
+        if loadopt is not None:
+            chunk_size = loadopt.local_opts.get(
+                "selectin_chunk_size", None
+            )
+
+        if chunk_size is None:
+            chunk_size = context._get_top_level_context().selectin_chunk_size
+
+        if chunk_size is None:
+            chunk_size = self._chunksize
+
+        if not isinstance(chunk_size, int) or isinstance(
+            chunk_size, bool
+        ) or chunk_size < 1:
+            raise sa_exc.ArgumentError(
+                "selectinload chunk_size must be a positive integer, got "
+                f"{chunk_size!r}"
+            )
+
+        budget = self._get_graph_budget(context)
+
+        chunk_size_explicit = (
+            (
+                loadopt is not None
+                and loadopt.local_opts.get(
+                    "selectin_chunk_size", None
+                )
+                is not None
+            )
+            or (
+                context._get_top_level_context().selectin_chunk_size
+                is not None
+            )
+        )
+
+        if budget is not None and budget.max_parameters is not None:
+            max_fit = budget.max_parameters // num_pk_cols
+            if max_fit < 1:
+                raise orm_exc.GraphBudgetExceeded(
+                    "Graph budget exceeded: a selectinload batch for %s "
+                    "requires at least %d bound parameter(s) per parent "
+                    "identity, but max_parameters=%d"
+                    % (self, num_pk_cols, budget.max_parameters)
+                )
+            if chunk_size > max_fit:
+                if chunk_size_explicit:
+                    raise orm_exc.GraphBudgetExceeded(
+                        "Graph budget exceeded: a selectinload batch for %s "
+                        "uses up to %d bound parameters (chunk_size=%d * %d "
+                        "primary key column(s)), exceeding "
+                        "max_parameters=%d.  Lower the chunk_size or raise "
+                        "the parameter budget."
+                        % (
+                            self,
+                            chunk_size * num_pk_cols,
+                            chunk_size,
+                            num_pk_cols,
+                            budget.max_parameters,
+                        )
+                    )
+                # automatically split smaller instead of raising, as no
+                # explicit chunk size was configured
+                chunk_size = max_fit
+
+        return chunk_size, budget, num_pk_cols
+
     def __init__(self, parent, strategy_key):
         super().__init__(parent, strategy_key)
         self.join_depth = self.parent_property.join_depth
@@ -3333,10 +3416,16 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
                 q,
                 context,
                 execution_options,
+                loadopt,
             )
         else:
             self._load_via_parent(
-                our_states, query_info, q, context, execution_options
+                our_states,
+                query_info,
+                q,
+                context,
+                execution_options,
+                loadopt,
             )
 
     def _load_via_child(
@@ -3347,24 +3436,32 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
         q,
         context,
         execution_options,
+        loadopt,
     ):
         uselist = self.uselist
+
+        chunk_size, budget, num_pk_cols = self._resolve_chunking(
+            context, loadopt, query_info
+        )
 
         # this sort is really for the benefit of the unit tests
         our_keys = sorted(our_states)
         while our_keys:
-            chunk = our_keys[0 : self._chunksize]
-            our_keys = our_keys[self._chunksize :]
+            chunk = our_keys[0:chunk_size]
+            our_keys = our_keys[chunk_size:]
+
+            primary_keys = [
+                key[0] if query_info.zero_idx else key for key in chunk
+            ]
+            if budget is not None:
+                budget.charge_statement(
+                    len(primary_keys) * num_pk_cols
+                )
             data = {
                 k: v
                 for k, v in context.session.execute(
                     q,
-                    params={
-                        "primary_keys": [
-                            key[0] if query_info.zero_idx else key
-                            for key in chunk
-                        ]
-                    },
+                    params={"primary_keys": primary_keys},
                     execution_options=execution_options,
                 ).unique()
             }
@@ -3395,19 +3492,32 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
             state.get_impl(self.key).set_committed_value(state, dict_, None)
 
     def _load_via_parent(
-        self, our_states, query_info, q, context, execution_options
+        self,
+        our_states,
+        query_info,
+        q,
+        context,
+        execution_options,
+        loadopt,
     ):
         uselist = self.uselist
         _empty_result = () if uselist else None
 
+        chunk_size, budget, num_pk_cols = self._resolve_chunking(
+            context, loadopt, query_info
+        )
+
         while our_states:
-            chunk = our_states[0 : self._chunksize]
-            our_states = our_states[self._chunksize :]
+            chunk = our_states[0:chunk_size]
+            our_states = our_states[chunk_size:]
 
             primary_keys = [
                 key[0] if query_info.zero_idx else key
                 for key, state, state_dict, overwrite in chunk
             ]
+
+            if budget is not None:
+                budget.charge_statement(len(primary_keys) * num_pk_cols)
 
             data = collections.defaultdict(list)
             for k, v in itertools.groupby(

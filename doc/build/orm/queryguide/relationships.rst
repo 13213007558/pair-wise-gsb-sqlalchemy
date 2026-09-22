@@ -831,7 +831,10 @@ Things to know about this kind of loading include:
   time, as the primary keys are rendered into a large IN expression in the SQL
   statement.  Some databases like Oracle Database have a hard limit on how
   large an IN expression can be, and overall the size of the SQL string
-  shouldn't be arbitrarily large.
+  shouldn't be arbitrarily large. The batch size is configurable per loader
+  via :paramref:`_orm.selectinload.chunk_size`, for a whole execution via
+  the ``orm_selectin_chunk_size`` execution option, or bounded automatically
+  by a :class:`_orm.GraphBudget`; see :ref:`selectin_batch_splitting`.
 
 * As "selectin" loading relies upon IN, for a mapping with composite primary
   keys, it must use the "tuple" form of IN, which looks like ``WHERE
@@ -843,6 +846,88 @@ Things to know about this kind of loading include:
   advantage to SQLAlchemy just running the SQL out for it to fail is that if a
   particular database does start supporting this syntax, it will work without
   any changes to SQLAlchemy (as was the case with SQLite).
+
+
+.. _selectin_batch_splitting:
+
+Batch Splitting and Graph Access Budgets
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The number of parent primary key values sent per SELECT IN statement can be
+configured explicitly, which is useful for database drivers that enforce a
+lower bound on the number of bound parameters per statement:
+
+.. sourcecode:: python
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    stmt = select(User).options(
+        selectinload(User.addresses, chunk_size=200)
+    )
+
+The same limit may be supplied for every selectin load within a single
+execution using an execution option, which also applies to selectin
+polymorphic loads:
+
+.. sourcecode:: python
+
+    result = session.execute(
+        select(User).options(selectinload(User.addresses)),
+        execution_options={"orm_selectin_chunk_size": 200},
+    )
+
+When a relationship targets a composite primary key, each parent identity
+expands to one bound parameter per primary key column, so a batch of
+``chunk_size`` identities uses ``chunk_size * number_of_primary_key_columns``
+parameters.
+
+For an automatic, observable bound on both the SQL and the object-identity
+side of the eager load, use :class:`_orm.GraphBudget`:
+
+.. sourcecode:: python
+
+    from sqlalchemy.orm import GraphBudget
+
+    budget = GraphBudget(
+        max_statements=100,
+        max_parameters=900,
+        max_identities=10000,
+    )
+    result = session.execute(
+        select(User).options(selectinload(User.addresses)),
+        execution_options={"orm_graph_budget": budget},
+    )
+
+    budget.statement_count  # SELECT statements emitted by post loaders
+    budget.parameter_count  # cumulative bound parameters
+    budget.identity_count   # distinct identities visited in the graph
+
+``max_parameters`` is enforced per statement as well as cumulatively, so a
+single SELECT IN can never exceed the limit.  When no explicit
+``chunk_size`` is configured, the selectin loader automatically shrinks its
+batches so that ``chunk_size * number_of_primary_key_columns`` fits within
+``max_parameters``; an explicit ``chunk_size`` that violates the limit
+raises :class:`_orm.GraphBudgetExceeded` before any statement is emitted.
+``max_identities`` counts each
+distinct identity exactly once, so cyclic or otherwise repeated relationship
+paths that resolve to the same ORM instance never consume additional budget;
+identities already present in the :class:`_orm.Session` identity map count
+once when they are visited and are never materialized into a second instance.
+Exceeding any limit raises :class:`_orm.GraphBudgetExceeded` **before** the
+next statement is emitted or the next entity is materialized, leaving objects
+loaded so far intact and the session usable.
+
+The budget applies to :func:`_orm.selectinload` post-load statements
+(including each recursive batch) and to entity materialization performed by
+all eager strategies, including :func:`_orm.joinedload` and
+:func:`_orm.contains_eager`.  It is independent per execution and is passed
+along automatically to all nested eager loads, including those run through
+:class:`_asyncio.AsyncSession`; give each concurrent execution its own budget.
+Batch splitting itself always preserves the order of parent rows, parent/child
+association and identity-map deduplication.  Distinct ``chunk_size`` settings
+for the same relationship path conflict just like other differing loader
+options, rather than being silently merged.
 
 
 .. _subquery_eager_loading:
