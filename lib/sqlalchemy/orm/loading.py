@@ -76,6 +76,215 @@ _new_runid = util.counter()
 _PopulatorDict = Dict[str, List[Tuple[str, Any]]]
 
 
+class LoaderBudget:
+    """Track and optionally limit eager-loading graph visits for an ORM
+    query execution.
+
+    A budget constrains the work performed by "post load" eager loaders
+    such as :func:`_orm.selectinload` along three axes:
+
+    * ``batches`` - the number of SQL SELECT IN batches emitted
+    * ``parameters`` - the total number of bound parameters consumed by
+      those batches
+    * ``visits`` - the number of object identity visits, i.e. individual
+      object states populated by the loader
+
+    Any of the three may be capped by passing the corresponding
+    ``max_`` limit; when a limit would be exceeded,
+    :class:`_orm.exc.LoaderBudgetExceeded` is raised before the
+    additional work is performed.  Objects already loaded and result
+    cursors already consumed follow the usual cleanup semantics of the
+    :class:`_orm.Session`.
+
+    A :class:`.LoaderBudget` may be passed directly as the
+    ``orm_eager_load_budget`` execution option, in which case its
+    counters may be inspected after the query runs::
+
+        budget = orm.LoaderBudget(max_batches=10)
+        result = session.execute(
+            select(Parent).options(selectinload(Parent.children)),
+            execution_options={"orm_eager_load_budget": budget},
+        )
+        print(budget.batches, budget.parameters, budget.visits)
+
+    Alternatively a dictionary of limits may be passed, in which case a
+    fresh tracker is maintained per query execution, so that concurrent
+    executions do not interfere with each other::
+
+        result = session.execute(
+            select(Parent).options(selectinload(Parent.children)),
+            execution_options={"orm_eager_load_budget": {"max_visits": 1000}},
+        )
+
+    A single :class:`.LoaderBudget` instance is not safe to share across
+    concurrently running queries; use the dictionary form, or one
+    instance per execution, for concurrent use.
+
+    .. versionadded:: 2.0.43
+
+    """
+
+    _LIMIT_NAMES = ("max_batches", "max_parameters", "max_visits")
+
+    def __init__(
+        self,
+        max_batches: Optional[int] = None,
+        max_parameters: Optional[int] = None,
+        max_visits: Optional[int] = None,
+    ):
+        for name, value in (
+            ("max_batches", max_batches),
+            ("max_parameters", max_parameters),
+            ("max_visits", max_visits),
+        ):
+            if value is not None and (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise sa_exc.ArgumentError(
+                    f"LoaderBudget {name} must be a non-negative "
+                    f"integer or None; got {value!r}"
+                )
+        self.max_batches = max_batches
+        self.max_parameters = max_parameters
+        self.max_visits = max_visits
+        self.batches = 0
+        self.parameters = 0
+        self.visits = 0
+
+    @classmethod
+    def _from_mapping(cls, mapping: Mapping[str, Any]) -> "LoaderBudget":
+        unknown = set(mapping).difference(cls._LIMIT_NAMES)
+        if unknown:
+            raise sa_exc.ArgumentError(
+                "Unknown LoaderBudget limit(s): %s; expected any of %s"
+                % (
+                    ", ".join(sorted(unknown)),
+                    ", ".join(cls._LIMIT_NAMES),
+                )
+            )
+        return cls(**{name: mapping.get(name) for name in cls._LIMIT_NAMES})
+
+    def hit_batch(self, num_parameters: int) -> None:
+        """Record one SQL batch consuming ``num_parameters`` bound
+        parameters, raising if a limit would be exceeded."""
+        if (
+            self.max_batches is not None
+            and self.batches + 1 > self.max_batches
+        ):
+            raise orm_exc.LoaderBudgetExceeded(
+                "Eager load graph visit budget exceeded: SQL batch "
+                f"limit of {self.max_batches} would be exceeded by "
+                f"batch #{self.batches + 1}"
+            )
+        if (
+            self.max_parameters is not None
+            and self.parameters + num_parameters > self.max_parameters
+        ):
+            raise orm_exc.LoaderBudgetExceeded(
+                "Eager load graph visit budget exceeded: bound parameter "
+                f"limit of {self.max_parameters} would be exceeded by "
+                f"batch of {num_parameters} parameters "
+                f"({self.parameters} already consumed)"
+            )
+        self.batches += 1
+        self.parameters += num_parameters
+
+    def hit_visits(self, count: int) -> None:
+        """Record ``count`` object identity visits, raising if the
+        visit limit would be exceeded."""
+        if (
+            self.max_visits is not None
+            and self.visits + count > self.max_visits
+        ):
+            raise orm_exc.LoaderBudgetExceeded(
+                "Eager load graph visit budget exceeded: object identity "
+                f"visit limit of {self.max_visits} would be exceeded by "
+                f"{count} further visit(s) ({self.visits} already made)"
+            )
+        self.visits += count
+
+
+def _eager_load_budget_for_context(
+    context: QueryContext,
+) -> Optional[LoaderBudget]:
+    """Resolve the :class:`.LoaderBudget` for an ORM query context.
+
+    Returns None if no ``orm_eager_load_budget`` execution option is
+    present.  A user-supplied :class:`.LoaderBudget` is returned as-is;
+    a mapping of limits is converted to a per-execution tracker that is
+    cached in the context's attributes, so concurrent executions remain
+    isolated from each other.
+    """
+    opt = context.execution_options.get("orm_eager_load_budget", None)
+    if opt is None:
+        opt = context.query._execution_options.get(
+            "orm_eager_load_budget", None
+        )
+    if opt is None:
+        return None
+    if isinstance(opt, LoaderBudget):
+        return opt
+    if not isinstance(opt, Mapping):
+        raise sa_exc.ArgumentError(
+            "orm_eager_load_budget execution option must be a "
+            f"LoaderBudget or a mapping of limits; got {opt!r}"
+        )
+    budget = context.attributes.get("_eager_load_budget_tracker", None)
+    if budget is None:
+        budget = LoaderBudget._from_mapping(opt)
+        context.attributes["_eager_load_budget_tracker"] = budget
+    return budget
+
+
+def _selectin_chunk_size(
+    context: QueryContext,
+    loadopt: Optional[Any],
+    num_key_cols: int,
+    default: int,
+) -> int:
+    """Resolve the effective SELECT IN chunk size, in key tuples, for a
+    selectin-style load.
+
+    The configured chunk size is a budget of bound parameters per SELECT
+    IN batch; for composite keys the number of key tuples per batch is
+    scaled down so that a single batch never exceeds the configured
+    parameter budget.
+
+    Precedence is: the ``chunk_size`` loader option, then the
+    ``orm_selectinload_chunk_size`` execution option, then the given
+    default.
+    """
+    chunk_size = None
+    if loadopt is not None:
+        chunk_size = loadopt.local_opts.get("chunk_size", None)
+    if chunk_size is None:
+        chunk_size = context.execution_options.get(
+            "orm_selectinload_chunk_size", None
+        )
+    if chunk_size is None:
+        chunk_size = context.query._execution_options.get(
+            "orm_selectinload_chunk_size", None
+        )
+    if chunk_size is None:
+        chunk_size = default
+    if (
+        not isinstance(chunk_size, int)
+        or isinstance(chunk_size, bool)
+        or chunk_size < 1
+    ):
+        raise sa_exc.ArgumentError(
+            "selectinload chunk size must be a positive integer; "
+            f"got {chunk_size!r}"
+        )
+    if num_key_cols > 1:
+        # the configured size is a bound-parameter budget; a composite
+        # key consumes one parameter per column
+        chunk_size = max(1, chunk_size // num_key_cols)
+    return chunk_size
+
+
 def instances(cursor: CursorResult[Any], context: QueryContext) -> Result[Any]:
     """Return a :class:`.Result` given an ORM query context.
 
@@ -109,7 +318,7 @@ def instances(cursor: CursorResult[Any], context: QueryContext) -> Result[Any]:
     )
 
     try:
-        (process, labels, extra) = list(
+        process, labels, extra = list(
             zip(
                 *[
                     query_entity.row_processor(context, cursor)
@@ -561,7 +770,7 @@ def load_on_pk_identity(
     if primary_key_identity is not None:
         mapper = query._propagate_attrs["plugin_subject"]
 
-        (_get_clause, _get_params) = mapper._get_clause
+        _get_clause, _get_params = mapper._get_clause
 
         # None present in ident - turn those comparisons
         # into "IS NULL"
@@ -1310,17 +1519,26 @@ def _load_subclass_via_in(
         if context.populate_existing:
             q2 = q2.execution_options(populate_existing=True)
 
+        num_key_cols = 1 if zero_idx else len(mapper.base_mapper.primary_key)
+        chunksize = _selectin_chunk_size(
+            context, None, num_key_cols, SelectInLoader._chunksize
+        )
+        budget = _eager_load_budget_for_context(context)
+        if budget is not None:
+            q2 = q2.execution_options(orm_eager_load_budget=budget)
         while states:
-            chunk = states[0 : SelectInLoader._chunksize]
-            states = states[SelectInLoader._chunksize :]
+            chunk = states[0:chunksize]
+            states = states[chunksize:]
+            primary_keys = [
+                state.key[1][0] if zero_idx else state.key[1]
+                for state, load_attrs in chunk
+            ]
+            if budget is not None:
+                budget.hit_batch(len(primary_keys) * num_key_cols)
+                budget.hit_visits(len(chunk))
             context.session.execute(
                 q2,
-                dict(
-                    primary_keys=[
-                        state.key[1][0] if zero_idx else state.key[1]
-                        for state, load_attrs in chunk
-                    ]
-                ),
+                dict(primary_keys=primary_keys),
             ).unique().scalars().all()
 
     return do_load

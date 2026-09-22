@@ -832,6 +832,48 @@ Things to know about this kind of loading include:
   statement.  Some databases like Oracle Database have a hard limit on how
   large an IN expression can be, and overall the size of the SQL string
   shouldn't be arbitrarily large.
+  This batch size is a budget of bound parameters per SELECT IN statement
+  and may be reconfigured, either per relationship path using the
+  :paramref:`_orm.selectinload.chunk_size` parameter, or for a whole
+  query execution using the ``orm_selectinload_chunk_size`` execution
+  option.  For mappings that use composite primary keys, the number of
+  key tuples included in each batch is scaled down so that a single
+  batch never exceeds the configured parameter budget::
+
+      stmt = (
+          select(User)
+          .options(selectinload(User.addresses, chunk_size=100))
+      )
+
+      # or for the whole execution
+      result = session.scalars(
+          stmt,
+          execution_options={"orm_selectinload_chunk_size": 100},
+      )
+
+  .. versionadded:: 2.0.43
+
+* The total amount of eager loading work performed for a single query
+  may be constrained using the ``orm_eager_load_budget`` execution
+  option, which accepts a :class:`_orm.LoaderBudget` or a dictionary
+  of limits.  The budget tracks the number of SELECT IN batches
+  emitted, the total number of bound parameters they consume, and the
+  number of object identity visits performed while populating the
+  object graph; when a configured limit would be exceeded,
+  :class:`_orm.exc.LoaderBudgetExceeded` is raised.  This provides a
+  safeguard for object graphs that contain cyclic or otherwise
+  unbounded relationship paths::
+
+      from sqlalchemy.orm import LoaderBudget
+
+      budget = LoaderBudget(max_batches=10, max_visits=5000)
+      result = session.scalars(
+          select(Node).options(selectinload(Node.children)),
+          execution_options={"orm_eager_load_budget": budget},
+      ).all()
+      print(budget.batches, budget.parameters, budget.visits)
+
+  .. versionadded:: 2.0.43
 
 * As "selectin" loading relies upon IN, for a mapping with composite primary
   keys, it must use the "tuple" form of IN, which looks like ``WHERE
@@ -1205,6 +1247,9 @@ Relationship Loader API
 .. autoclass:: sqlalchemy.orm.Load
     :members:
     :inherited-members: Generative
+
+.. autoclass:: sqlalchemy.orm.LoaderBudget
+    :members:
 
 .. autofunction:: noload
 

@@ -3187,6 +3187,18 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
             ]
 
         pk_cols = query_info.pk_cols
+        chunksize = loading._selectin_chunk_size(
+            context, loadopt, len(pk_cols), self._chunksize
+        )
+        budget = loading._eager_load_budget_for_context(context)
+        if budget is not None:
+            # propagate the resolved budget to the secondary SELECT IN
+            # query, so that nested eager loads beneath it participate
+            # in the same graph visit budget
+            execution_options = execution_options.union(
+                {"orm_eager_load_budget": budget}
+            )
+
         in_expr = query_info.in_expr
 
         if not query_info.load_with_join:
@@ -3333,10 +3345,18 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
                 q,
                 context,
                 execution_options,
+                chunksize,
+                budget,
             )
         else:
             self._load_via_parent(
-                our_states, query_info, q, context, execution_options
+                our_states,
+                query_info,
+                q,
+                context,
+                execution_options,
+                chunksize,
+                budget,
             )
 
     def _load_via_child(
@@ -3347,14 +3367,21 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
         q,
         context,
         execution_options,
+        chunksize,
+        budget,
     ):
         uselist = self.uselist
 
         # this sort is really for the benefit of the unit tests
         our_keys = sorted(our_states)
         while our_keys:
-            chunk = our_keys[0 : self._chunksize]
-            our_keys = our_keys[self._chunksize :]
+            chunk = our_keys[0:chunksize]
+            our_keys = our_keys[chunksize:]
+
+            if budget is not None:
+                budget.hit_batch(len(chunk) * len(query_info.pk_cols))
+                budget.hit_visits(sum(len(our_states[key]) for key in chunk))
+
             data = {
                 k: v
                 for k, v in context.session.execute(
@@ -3393,21 +3420,34 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
             # note it's OK if this is a uselist=True attribute, the empty
             # collection will be populated
             state.get_impl(self.key).set_committed_value(state, dict_, None)
+        if budget is not None and none_states:
+            budget.hit_visits(len(none_states))
 
     def _load_via_parent(
-        self, our_states, query_info, q, context, execution_options
+        self,
+        our_states,
+        query_info,
+        q,
+        context,
+        execution_options,
+        chunksize,
+        budget,
     ):
         uselist = self.uselist
         _empty_result = () if uselist else None
 
         while our_states:
-            chunk = our_states[0 : self._chunksize]
-            our_states = our_states[self._chunksize :]
+            chunk = our_states[0:chunksize]
+            our_states = our_states[chunksize:]
 
             primary_keys = [
                 key[0] if query_info.zero_idx else key
                 for key, state, state_dict, overwrite in chunk
             ]
+
+            if budget is not None:
+                budget.hit_batch(len(primary_keys) * len(query_info.pk_cols))
+                budget.hit_visits(len(chunk))
 
             data = collections.defaultdict(list)
             for k, v in itertools.groupby(

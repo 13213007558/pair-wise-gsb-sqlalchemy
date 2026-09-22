@@ -96,6 +96,7 @@ from .interfaces import RelationshipDirection as RelationshipDirection
 from .interfaces import UserDefinedOption as UserDefinedOption
 from .loading import merge_frozen_result as merge_frozen_result
 from .loading import merge_result as merge_result
+from .loading import LoaderBudget as LoaderBudget
 from .mapped_collection import attribute_keyed_dict as attribute_keyed_dict
 from .mapped_collection import (
     attribute_mapped_collection as attribute_mapped_collection,

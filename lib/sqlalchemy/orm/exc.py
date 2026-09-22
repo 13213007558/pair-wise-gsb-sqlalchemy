@@ -174,6 +174,19 @@ class UnmappedColumnError(sa_exc.InvalidRequestError):
     """Mapping operation was requested on an unknown column."""
 
 
+class LoaderBudgetExceeded(sa_exc.InvalidRequestError):
+    """An eager-loading graph visit budget was exhausted.
+
+    Raised when a :class:`_orm.LoaderBudget` configured for a query
+    execution is exceeded while loading relationships, e.g. too many
+    SELECT IN batches, too many bound parameters, or too many object
+    identity visits were required to satisfy the requested eager loads.
+
+    .. versionadded:: 2.0.43
+
+    """
+
+
 class LoaderStrategyException(sa_exc.InvalidRequestError):
     """A loader strategy for an attribute does not exist."""
 

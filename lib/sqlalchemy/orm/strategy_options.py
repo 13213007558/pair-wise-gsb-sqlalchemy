@@ -359,6 +359,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         self,
         attr: _AttrType,
         recursion_depth: Optional[int] = None,
+        chunk_size: Optional[int] = None,
     ) -> Self:
         """Indicate that the given attribute should be loaded using
         SELECT IN eager loading.
@@ -397,6 +398,17 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
          .. versionadded:: 2.0 added
             :paramref:`_orm.selectinload.recursion_depth`
 
+        :param chunk_size: optional positive int; indicates the maximum
+         number of bound parameters that a single SELECT IN batch emitted
+         for this relationship may consume.  For primary keys of more
+         than one column, the number of key tuples per batch is scaled
+         down accordingly, so that a single batch never exceeds this
+         parameter budget.  When not given, the
+         ``orm_selectinload_chunk_size`` execution option is consulted,
+         falling back to a default of 500 parameters per batch.
+
+         .. versionadded:: 2.0.43
+
 
         .. seealso::
 
@@ -405,10 +417,22 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
             :ref:`selectin_eager_loading`
 
         """
+        opts: Dict[str, Any] = {"recursion_depth": recursion_depth}
+        if chunk_size is not None:
+            if (
+                not isinstance(chunk_size, int)
+                or isinstance(chunk_size, bool)
+                or chunk_size < 1
+            ):
+                raise sa_exc.ArgumentError(
+                    "selectinload chunk_size must be a positive integer; "
+                    f"got {chunk_size!r}"
+                )
+            opts["chunk_size"] = chunk_size
         return self._set_relationship_strategy(
             attr,
             {"lazy": "selectin"},
-            opts={"recursion_depth": recursion_depth},
+            opts=opts,
         )
 
     def lazyload(self, attr: _AttrType) -> Self:
@@ -2442,11 +2466,14 @@ def subqueryload(*keys: _AttrType) -> _AbstractLoad:
 
 @loader_unbound_fn
 def selectinload(
-    *keys: _AttrType, recursion_depth: Optional[int] = None
+    *keys: _AttrType,
+    recursion_depth: Optional[int] = None,
+    chunk_size: Optional[int] = None,
 ) -> _AbstractLoad:
-    return _generate_from_keys(
-        Load.selectinload, keys, False, {"recursion_depth": recursion_depth}
-    )
+    opts: Dict[str, Any] = {"recursion_depth": recursion_depth}
+    if chunk_size is not None:
+        opts["chunk_size"] = chunk_size
+    return _generate_from_keys(Load.selectinload, keys, False, opts)
 
 
 @loader_unbound_fn
