@@ -669,9 +669,9 @@ class _ConnectionRecord(ConnectionPoolEntry):
         self.dbapi_connection = None
 
         self.__pool = pool
+        self.finalize_callback = deque()
         if connect:
             self.__connect()
-        self.finalize_callback = deque()
 
     dbapi_connection: Optional[DBAPIConnection]
 
@@ -761,14 +761,19 @@ class _ConnectionRecord(ConnectionPoolEntry):
         self.fairy_ref = None
         connection = self.dbapi_connection
         pool = self.__pool
-        while self.finalize_callback:
-            finalizer = self.finalize_callback.pop()
-            if connection is not None:
-                finalizer(connection)
-        if pool.dispatch.checkin:
-            pool.dispatch.checkin(connection, self)
-
-        pool._return_conn(self)
+        try:
+            while self.finalize_callback:
+                finalizer = self.finalize_callback.pop()
+                if connection is not None:
+                    finalizer(connection)
+            if pool.dispatch.checkin:
+                pool.dispatch.checkin(connection, self)
+        finally:
+            # ensure the record is always returned to the pool, even if a
+            # finalizer or the checkin event raises (including
+            # asyncio.CancelledError), so that the pool does not lose
+            # track of the connection.
+            pool._return_conn(self)
 
     @property
     def in_use(self) -> bool:
@@ -812,8 +817,15 @@ class _ConnectionRecord(ConnectionPoolEntry):
         if soft:
             self._soft_invalidate_time = time.time()
         else:
-            self.__close(terminate=True)
-            self.dbapi_connection = None
+            try:
+                self.__close(terminate=True)
+            finally:
+                # if terminate/close is interrupted by an exit exception
+                # such as asyncio.CancelledError, make sure the record
+                # still drops its reference to the connection, so that
+                # the pool will not attempt to reuse it and the pool
+                # ledger remains consistent.
+                self.dbapi_connection = None
 
     def get_connection(self) -> DBAPIConnection:
         recycle = False
@@ -901,16 +913,26 @@ class _ConnectionRecord(ConnectionPoolEntry):
         else:
             # in SQLAlchemy 1.4 the first_connect event is not used by
             # the engine, so this will usually not be set
-            if pool.dispatch.first_connect:
-                pool.dispatch.first_connect.for_modify(
-                    pool.dispatch
-                ).exec_once_unless_exception(self.dbapi_connection, self)
+            try:
+                if pool.dispatch.first_connect:
+                    pool.dispatch.first_connect.for_modify(
+                        pool.dispatch
+                    ).exec_once_unless_exception(self.dbapi_connection, self)
 
-            # init of the dialect now takes place within the connect
-            # event, so ensure a mutex is used on the first run
-            pool.dispatch.connect.for_modify(
-                pool.dispatch
-            )._exec_w_sync_on_first_run(self.dbapi_connection, self)
+                # init of the dialect now takes place within the connect
+                # event, so ensure a mutex is used on the first run
+                pool.dispatch.connect.for_modify(
+                    pool.dispatch
+                )._exec_w_sync_on_first_run(self.dbapi_connection, self)
+            except BaseException:
+                # if the connect / first_connect event fails, which
+                # includes asyncio.CancelledError raised while an async
+                # event handler (such as dialect initialization) is
+                # awaiting, make sure the freshly created DBAPI
+                # connection is closed and not leaked.  the connection
+                # record itself is discarded by the caller.
+                with util.safe_reraise():
+                    self.__close(terminate=True)
 
 
 def _finalize_fairy(
@@ -1008,8 +1030,33 @@ def _finalize_fairy(
                 "Exception during reset or similar", exc_info=True
             )
             if connection_record:
-                connection_record.invalidate(e=e)
+                try:
+                    connection_record.invalidate(e=e)
+                except BaseException:
+                    if isinstance(e, Exception):
+                        raise
+                    # if we are already propagating an exit exception such
+                    # as asyncio.CancelledError, don't let a failure while
+                    # invalidating the connection prevent the record from
+                    # being returned to the pool below; the original
+                    # exception will continue to propagate.
+                    pool.logger.error(
+                        "Exception while invalidating connection",
+                        exc_info=True,
+                    )
             if not isinstance(e, Exception):
+                # for exit exceptions such as asyncio.CancelledError or
+                # KeyboardInterrupt, the connection has been invalidated
+                # above; ensure the connection record is checked back into
+                # the pool before propagating, so that the pool ledger
+                # remains consistent and subsequent checkouts are not
+                # blocked waiting for a connection that will never be
+                # returned.
+                if (
+                    connection_record
+                    and connection_record.fairy_ref is not None
+                ):
+                    connection_record.checkin()
                 raise
         finally:
             if detach and is_gc_cleanup and dont_restore_gced:
@@ -1472,8 +1519,19 @@ class _ConnectionFairy(PoolProxiedConnection):
             util.warn("Can't invalidate an already-closed connection.")
             return
         if self._connection_record:
-            self._connection_record.invalidate(e=e, soft=soft)
-        if not soft:
+            try:
+                self._connection_record.invalidate(e=e, soft=soft)
+            finally:
+                if not soft:
+                    # if the record-level invalidate is interrupted by an
+                    # exit exception such as asyncio.CancelledError (e.g.
+                    # while terminating the connection), make sure the
+                    # fairy is disassociated from the connection and the
+                    # record is checked back into the pool, so that the
+                    # pool ledger remains consistent.
+                    self.dbapi_connection = None  # type: ignore
+                    self._checkin()
+        elif not soft:
             # prevent any rollback / reset actions etc. on
             # the connection
             self.dbapi_connection = None  # type: ignore

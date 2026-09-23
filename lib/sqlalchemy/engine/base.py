@@ -1239,30 +1239,38 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
         """
 
-        if self._transaction:
-            self._transaction.close()
-            skip_reset = True
-        else:
-            skip_reset = False
-
-        if self._dbapi_connection is not None:
-            conn = self._dbapi_connection
-
-            # as we just closed the transaction, close the connection
-            # pool connection without doing an additional reset
-            if skip_reset:
-                cast("_ConnectionFairy", conn)._close_special(
-                    transaction_reset=True
-                )
+        try:
+            if self._transaction:
+                self._transaction.close()
+                skip_reset = True
             else:
-                conn.close()
+                skip_reset = False
 
+            if self._dbapi_connection is not None:
+                conn = self._dbapi_connection
+
+                # as we just closed the transaction, close the connection
+                # pool connection without doing an additional reset
+                if skip_reset:
+                    cast("_ConnectionFairy", conn)._close_special(
+                        transaction_reset=True
+                    )
+                else:
+                    conn.close()
+        finally:
+            # ensure the Connection is disassociated from the pool
+            # connection and marked closed even if the transaction close /
+            # connection return above is interrupted by an exit exception
+            # such as asyncio.CancelledError, so that the object is not
+            # left referencing a connection that was already returned to
+            # the pool.
+            #
             # There is a slight chance that conn.close() may have
             # triggered an invalidation here in which case
             # _dbapi_connection would already be None, however usually
             # it will be non-None here and in a "closed" state.
             self._dbapi_connection = None
-        self.__can_reconnect = False
+            self.__can_reconnect = False
 
     @overload
     def scalar(
