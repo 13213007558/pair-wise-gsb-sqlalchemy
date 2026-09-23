@@ -2576,7 +2576,6 @@ class ConstraintReflectionTest(fixtures.TestBase):
             ],
         )
 
-    @testing.fails("need to come up with new regex and/or DDL parsing")
     def test_check_constraint_multiline(self):
         """test for #11677"""
 
@@ -2594,6 +2593,109 @@ class ConstraintReflectionTest(fixtures.TestBase):
                 },
                 {"sqltext": "id > 0", "name": None},
                 {"sqltext": "prefix NOT GLOB '*[^-. /#,]*'", "name": None},
+            ],
+        )
+
+    @testing.combinations(
+        ('"ck, dq"', "ck, dq"),
+        ("[ck, br]", "ck, br"),
+        ("`ck, bt`", "ck, bt"),
+        ("'ck, sq'", "ck, sq"),
+        ("plain_ck", "plain_ck"),
+        argnames="ddl_name,expected",
+    )
+    def test_check_constraint_quoted_names(
+        self, connection, metadata, ddl_name, expected
+    ):
+        """test #12924; CHECK constraint names using each of the four
+        identifier quoting styles supported by SQLite, including names
+        containing commas."""
+
+        Table("t", metadata, Column("a", Integer))
+        connection.exec_driver_sql(
+            "CREATE TABLE t (a INTEGER, "
+            "CONSTRAINT %s CHECK (a > 1))" % ddl_name
+        )
+        eq_(
+            inspect(connection).get_check_constraints("t"),
+            [{"sqltext": "a > 1", "name": expected}],
+        )
+
+    def test_check_constraint_check_keyword_in_names(
+        self, connection, metadata
+    ):
+        """test #12924; CHECK appearing inside table/column names must not
+        produce false constraint matches."""
+
+        Table("mychecktable", metadata, Column("checkcol", Integer))
+        connection.exec_driver_sql(
+            'CREATE TABLE mychecktable (checkcol INTEGER, '
+            'CONSTRAINT c_real CHECK (checkcol < 10))'
+        )
+        eq_(
+            inspect(connection).get_check_constraints("mychecktable"),
+            [{"sqltext": "checkcol < 10", "name": "c_real"}],
+        )
+
+    def test_check_constraint_parens_in_string_literal(
+        self, connection, metadata
+    ):
+        """parentheses and commas inside string literals must not break
+        balanced-parenthesis scanning of the CHECK expression."""
+
+        Table("t", metadata, Column("a", Integer), Column("b", String))
+        connection.exec_driver_sql(
+            "CREATE TABLE t (a INTEGER, b VARCHAR(50), "
+            "CONSTRAINT ck1 CHECK (a > 0 AND b != 'x),(y'), "
+            "CONSTRAINT ck2 CHECK (a IN (1, 2, (3))))"
+        )
+        eq_(
+            inspect(connection).get_check_constraints("t"),
+            [
+                {"sqltext": "a > 0 AND b != 'x),(y'", "name": "ck1"},
+                {"sqltext": "a IN (1, 2, (3))", "name": "ck2"},
+            ],
+        )
+
+    def test_quoted_constraint_names(self, connection, metadata):
+        """quoted PK / UNIQUE / FK constraint names containing commas are
+        reflected faithfully."""
+
+        Table("t1", metadata, Column("a", Integer))
+        Table("t2", metadata, Column("a", Integer))
+        connection.exec_driver_sql("CREATE TABLE t1 (a INTEGER)")
+        connection.exec_driver_sql(
+            'CREATE TABLE t2 (a INTEGER, b INTEGER, c INTEGER, '
+            'CONSTRAINT "pk, name" PRIMARY KEY (a), '
+            'CONSTRAINT "uq, name" UNIQUE (b), '
+            'CONSTRAINT "fk, name" FOREIGN KEY (c) REFERENCES t1 (a))'
+        )
+        inspector = inspect(connection)
+        eq_(
+            inspector.get_pk_constraint("t2"),
+            {"constrained_columns": ["a"], "name": "pk, name"},
+        )
+        eq_(
+            inspector.get_unique_constraints("t2"),
+            [{"name": "uq, name", "column_names": ["b"]}],
+        )
+        eq_(
+            [
+                {
+                    "name": fk["name"],
+                    "constrained_columns": fk["constrained_columns"],
+                    "referred_table": fk["referred_table"],
+                    "referred_columns": fk["referred_columns"],
+                }
+                for fk in inspector.get_foreign_keys("t2")
+            ],
+            [
+                {
+                    "name": "fk, name",
+                    "constrained_columns": ["c"],
+                    "referred_table": "t1",
+                    "referred_columns": ["a"],
+                }
             ],
         )
 

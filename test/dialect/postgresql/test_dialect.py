@@ -3,7 +3,6 @@ import dataclasses
 import datetime
 import logging
 import logging.handlers
-import re
 
 from sqlalchemy import BigInteger
 from sqlalchemy import bindparam
@@ -76,14 +75,10 @@ def _fk_expected(
         referred_schema,
         referred_table,
         referred_columns,
-        f"MATCH {match}" if match else None,
         match,
-        f"ON UPDATE {onupdate}" if onupdate else None,
         onupdate,
-        f"ON DELETE {ondelete}" if ondelete else None,
         ondelete,
         deferrable,
-        f"INITIALLY {initially}" if initially else None,
         initially,
     )
 
@@ -148,12 +143,41 @@ class DialectTest(fixtures.TestBase):
                 initially="DEFERRED",
             ),
         ),
+        (
+            "FOREIGN KEY (tid) REFERENCES some_table(id) "
+            "ON DELETE SET NULL "
+            "ON UPDATE CASCADE",
+            _fk_expected(
+                "tid",
+                "some_table",
+                "id",
+                onupdate="CASCADE",
+                ondelete="SET NULL",
+            ),
+        ),
+        (
+            "FOREIGN KEY (tid) REFERENCES some_table(id) "
+            "ON DELETE SET NULL (tid)",
+            _fk_expected(
+                "tid",
+                "some_table",
+                "id",
+                ondelete="SET NULL (tid)",
+            ),
+        ),
+        (
+            'FOREIGN KEY (tid) REFERENCES "some""table"(id)',
+            _fk_expected("tid", '"some""table"', "id"),
+        ),
+        (
+            'FOREIGN KEY (tid) REFERENCES "sch\u00e9ma"."tbl\u00e9"(id)',
+            _fk_expected(
+                "tid", '"tbl\u00e9"', "id", referred_schema='"sch\u00e9ma"'
+            ),
+        ),
     )
     def test_fk_parsing(self, condef, expected):
-        FK_REGEX = postgresql.dialect()._fk_regex_pattern
-        groups = re.search(FK_REGEX, condef).groups()
-
-        eq_(groups, expected)
+        eq_(postgresql.dialect()._parse_fk(condef), expected)
 
     def test_range_constructor(self):
         """test kwonly argments in the range constructor, as we had
