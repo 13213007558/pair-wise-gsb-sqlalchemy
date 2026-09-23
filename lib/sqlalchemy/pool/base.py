@@ -667,11 +667,11 @@ class _ConnectionRecord(ConnectionPoolEntry):
         self.fairy_ref = None
         self.starttime = 0
         self.dbapi_connection = None
+        self.finalize_callback = deque()
 
         self.__pool = pool
         if connect:
             self.__connect()
-        self.finalize_callback = deque()
 
     dbapi_connection: Optional[DBAPIConnection]
 
@@ -899,18 +899,33 @@ class _ConnectionRecord(ConnectionPoolEntry):
             with util.safe_reraise():
                 pool.logger.debug("Error on connect(): %s", e)
         else:
-            # in SQLAlchemy 1.4 the first_connect event is not used by
-            # the engine, so this will usually not be set
-            if pool.dispatch.first_connect:
-                pool.dispatch.first_connect.for_modify(
-                    pool.dispatch
-                ).exec_once_unless_exception(self.dbapi_connection, self)
+            try:
+                # in SQLAlchemy 1.4 the first_connect event is not used by
+                # the engine, so this will usually not be set
+                if pool.dispatch.first_connect:
+                    pool.dispatch.first_connect.for_modify(
+                        pool.dispatch
+                    ).exec_once_unless_exception(self.dbapi_connection, self)
 
-            # init of the dialect now takes place within the connect
-            # event, so ensure a mutex is used on the first run
-            pool.dispatch.connect.for_modify(
-                pool.dispatch
-            )._exec_w_sync_on_first_run(self.dbapi_connection, self)
+                # init of the dialect now takes place within the connect
+                # event, so ensure a mutex is used on the first run
+                pool.dispatch.connect.for_modify(
+                    pool.dispatch
+                )._exec_w_sync_on_first_run(self.dbapi_connection, self)
+            except BaseException as e:
+                # the connect / first_connect event (which includes
+                # dialect initialization and its initial rollback) failed,
+                # e.g. the surrounding asyncio task was cancelled.  the
+                # connection is in an indeterminate, partially initialized
+                # state; it must neither be returned to the pool nor left
+                # dangling, so close it out before propagating.  this is
+                # essential for asyncio drivers where the connection cannot
+                # be cleaned up by the garbage collector.
+                with util.safe_reraise():
+                    pool.logger.debug(
+                        "Error on connect() event, closing connection: %s", e
+                    )
+                    self.__close(terminate=True)
 
 
 def _finalize_fairy(
@@ -1010,6 +1025,17 @@ def _finalize_fairy(
             if connection_record:
                 connection_record.invalidate(e=e)
             if not isinstance(e, Exception):
+                # for "exit" exceptions, notably asyncio.CancelledError,
+                # the record was invalidated above which closes the DBAPI
+                # connection; the slot held by the record still has to be
+                # returned to the pool, or it will remain checked out
+                # indefinitely (until gc, if ever), eventually starving
+                # the pool.  check the record in before propagating.
+                if (
+                    connection_record is not None
+                    and connection_record.fairy_ref is not None
+                ):
+                    connection_record.checkin()
                 raise
         finally:
             if detach and is_gc_cleanup and dont_restore_gced:
