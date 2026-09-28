@@ -21,6 +21,7 @@ import typing
 from typing import Any
 from typing import Callable
 from typing import Generic
+from typing import Hashable
 from typing import Iterable
 from typing import List
 from typing import Optional
@@ -67,6 +68,56 @@ if typing.TYPE_CHECKING:
     from ..engine.interfaces import SchemaTranslateMapType
 
 _SI = TypeVar("_SI", bound=Union["SchemaItem", str])
+
+
+def _ddl_identity_token(obj: Any) -> Optional[Hashable]:
+    """Return a hashable token that identifies a schema-level object for
+    the purpose of DDL compilation caching.
+
+    The token is identity based: structurally equivalent but distinct
+    objects (such as those produced by Table.to_metadata) never share a
+    token, so a cached compilation can never be reused for an object it
+    was not generated from.
+
+    Returns None if no hashable token can be determined, in which case
+    the DDL element should not be cached at all.
+
+    """
+    if obj is None or isinstance(obj, str):
+        return obj
+    generate_cache_key = getattr(obj, "_generate_cache_key", None)
+    if generate_cache_key is not None:
+        cache_key = generate_cache_key()
+        if cache_key is not None:
+            return cache_key.key
+    try:
+        hash(obj)
+    except TypeError:
+        return None
+    return ("_identity", obj)
+
+
+def _dialect_version_token(dialect: Dialect) -> Hashable:
+    """Return a hashable token representing version-dependent compilation
+    capabilities of the given dialect.
+
+    This is included in DDL cache keys so that rendering decisions that
+    depend on the database version can never leak from one environment
+    to another through the compiled cache.
+
+    """
+    version_info = getattr(dialect, "server_version_info", None)
+    if version_info is None:
+        return None
+    try:
+        return ("_version", tuple(version_info))
+    except TypeError:
+        pass
+    try:
+        hash(version_info)
+    except TypeError:
+        return ("_version", repr(version_info))
+    return ("_version", version_info)
 
 
 class BaseDDLElement(ClauseElement):
@@ -341,6 +392,104 @@ class ExecutableDDLElement(roles.DDLRole, Executable, BaseDDLElement):
 
         self.against(target)._invoke_with(bind)
 
+    def _compile_w_cache(
+        self,
+        dialect: Dialect,
+        *,
+        compiled_cache: Optional[CompiledCacheType],
+        column_keys: List[str],
+        for_executemany: bool = False,
+        schema_translate_map: Optional[SchemaTranslateMapType] = None,
+        **kw: Any,
+    ) -> tuple[
+        Compiled,
+        Optional[typing_Sequence[BindParameter[Any]]],
+        Optional[_CoreSingleExecuteParams],
+        CacheStats,
+    ]:
+        """Compile this DDL element, using the given compiled cache if
+        this element is cacheable.
+
+        Environment-specific state - conditional DDL predicates, dialect
+        version capabilities - is incorporated into the cache *key* and
+        is re-evaluated on every call; it is never baked into the cached
+        value.  A cache hit can therefore never cause a decision made
+        for one environment to be reused for another.
+
+        """
+        cache_key: Optional[Hashable]
+
+        if compiled_cache is not None and dialect._supports_statement_cache:
+            cache_key = self._ddl_cache_key(
+                dialect, schema_translate_map=schema_translate_map
+            )
+        else:
+            cache_key = None
+
+        compiled_sql: Compiled
+
+        if cache_key is not None:
+            key = (
+                dialect,
+                _dialect_version_token(dialect),
+                cache_key,
+                bool(schema_translate_map),
+            )
+            cached = compiled_cache.get(key)
+            if cached is None:
+                cache_hit = dialect.CACHE_MISS
+                compiled_sql = self._compile_ddl_w_context(
+                    dialect, schema_translate_map=schema_translate_map, **kw
+                )
+                compiled_cache[key] = compiled_sql
+            else:
+                cache_hit = dialect.CACHE_HIT
+                compiled_sql = cached
+        else:
+            if not dialect._supports_statement_cache:
+                cache_hit = dialect.NO_DIALECT_SUPPORT
+            elif compiled_cache is None:
+                cache_hit = dialect.CACHING_DISABLED
+            else:
+                cache_hit = dialect.NO_CACHE_KEY
+            compiled_sql = self._compile_ddl_w_context(
+                dialect, schema_translate_map=schema_translate_map, **kw
+            )
+
+        return compiled_sql, None, None, cache_hit
+
+    def _ddl_cache_key(
+        self,
+        dialect: Dialect,
+        schema_translate_map: Optional[SchemaTranslateMapType] = None,
+    ) -> Optional[Hashable]:
+        """Return a hashable cache key for this DDL element, or None if
+        this element should not participate in compilation caching.
+
+        The key must capture all element-local state that affects the
+        rendered SQL, including conditional DDL predicate outcomes.
+
+        """
+        return None
+
+    def _ddl_error_context(self) -> str:
+        """Return a short description of this DDL element used to
+        provide object context within error messages."""
+        return repr(self)
+
+    def _compile_ddl_w_context(
+        self, dialect: Dialect, **kw: Any
+    ) -> Compiled:
+        """Compile this DDL element, ensuring that compilation errors
+        carry both the DDL object and the dialect as context."""
+        try:
+            return self._compiler(dialect, **kw)
+        except exc.CompileError as ce:
+            raise exc.CompileError(
+                "(while compiling DDL %s against dialect %r): %s"
+                % (self._ddl_error_context(), dialect.name, ce)
+            ) from ce
+
     def _generate(self):
         s = self.__class__.__new__(self.__class__)
         s.__dict__ = self.__dict__.copy()
@@ -426,6 +575,23 @@ class DDL(ExecutableDDLElement):
         self.statement = statement
         self.context = context or {}
 
+    def _ddl_cache_key(
+        self,
+        dialect: Dialect,
+        schema_translate_map: Optional[SchemaTranslateMapType] = None,
+    ) -> Optional[Hashable]:
+        try:
+            context_key = tuple(sorted(self.context.items()))
+            hash(context_key)
+        except TypeError:
+            return None
+        return (
+            "DDL",
+            self.statement,
+            context_key,
+            _ddl_identity_token(self.target),
+        )
+
     def __repr__(self):
         parts = [repr(self.statement)]
         if self.context:
@@ -469,11 +635,43 @@ class _CreateDropBase(ExecutableDDLElement, Generic[_SI]):
         """
         return False
 
+    def _ddl_cache_key(
+        self,
+        dialect: Dialect,
+        schema_translate_map: Optional[SchemaTranslateMapType] = None,
+    ) -> Optional[Hashable]:
+        element_token = _ddl_identity_token(self.element)
+        if element_token is None:
+            return None
+        state_key = self._ddl_state_key(dialect)
+        if state_key is None:
+            return None
+        return (
+            self.__class__,
+            element_token,
+            state_key,
+        )
+
+    def _ddl_state_key(self, dialect: Dialect) -> Optional[Hashable]:
+        """Return hashable element-local state that affects compilation,
+        or None if this element should not be cached."""
+        return ()
+
+    def _ddl_error_context(self) -> str:
+        element = self.element
+        description = getattr(element, "description", None)
+        if description is None:
+            description = repr(element)
+        return "%s(%s)" % (type(self).__name__, description)
+
 
 class _CreateBase(_CreateDropBase[_SI]):
     def __init__(self, element: _SI, if_not_exists: bool = False) -> None:
         super().__init__(element)
         self.if_not_exists = if_not_exists
+
+    def _ddl_state_key(self, dialect: Dialect) -> Optional[Hashable]:
+        return (("if_not_exists", self.if_not_exists),)
 
 
 class TableCreateDDL(_CreateBase["Table"]):
@@ -486,6 +684,9 @@ class _DropBase(_CreateDropBase[_SI]):
     def __init__(self, element: _SI, if_exists: bool = False) -> None:
         super().__init__(element)
         self.if_exists = if_exists
+
+    def _ddl_state_key(self, dialect: Dialect) -> Optional[Hashable]:
+        return (("if_exists", self.if_exists),)
 
 
 class TableDropDDL(_DropBase["Table"]):
