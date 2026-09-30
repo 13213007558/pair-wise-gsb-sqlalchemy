@@ -968,7 +968,9 @@ class ResultFetchStrategy:
         result: CursorResult[Any],
         dbapi_cursor: DBAPICursor,
     ) -> Any:
-        raise NotImplementedError()
+        rows = dbapi_cursor.fetchall()
+        result._soft_close()
+        return rows
 
     def handle_exception(
         self,
@@ -1079,6 +1081,18 @@ class CursorFetchStrategy(ResultFetchStrategy):
         dbapi_cursor: Optional[DBAPICursor],
         err: BaseException,
     ) -> NoReturn:
+        result._soft_closed = False
+        try:
+            result._soft_close(hard=True)
+        except BaseException:
+            try:
+                result.closed = True
+                result.cursor_strategy = _NO_CURSOR_DQL
+                result.connection._safe_close_cursor(dbapi_cursor)
+                result.cursor = None
+                result._soft_closed = True
+            except BaseException:
+                pass
         result.connection._handle_dbapi_exception(
             err, None, None, dbapi_cursor, result.context
         )
@@ -1134,9 +1148,7 @@ class CursorFetchStrategy(ResultFetchStrategy):
         dbapi_cursor: DBAPICursor,
     ) -> Any:
         try:
-            rows = dbapi_cursor.fetchall()
-            result._soft_close()
-            return rows
+            return super().fetchall(result, dbapi_cursor)
         except BaseException as e:
             self.handle_exception(result, dbapi_cursor, e)
 
@@ -1435,6 +1447,8 @@ class CursorResult(Result[_T]):
         self.cursor = context.cursor
         self.cursor_strategy = cursor_strategy
         self.connection = context.root_connection
+        if context.is_crud and context.compiled.effective_returning:
+            self.connection._register_result(self)
         self._echo = echo = (
             self.connection._echo and context.engine._should_log_debug()
         )
@@ -1568,6 +1582,7 @@ class CursorResult(Result[_T]):
         if not self._soft_closed:
             cursor = self.cursor
             self.cursor = None  # type: ignore
+            self.connection._unregister_result(self)
             self.connection._safe_close_cursor(cursor)
             self._soft_closed = True
 

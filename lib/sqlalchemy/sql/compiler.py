@@ -23,6 +23,7 @@ To generate user-defined SQL strings, see
 :doc:`/ext/compiler`.
 
 """
+
 from __future__ import annotations
 
 import collections
@@ -5233,8 +5234,10 @@ class SQLCompiler(Compiled):
         returning_cols: Sequence[_ColumnsClauseElement],
         *,
         populate_result_map: bool,
+        has_extra_froms: bool = False,
         **kw: Any,
     ) -> str:
+        self._validate_dml_returning(stmt, has_extra_froms)
         columns = [
             self._label_returning_column(
                 stmt,
@@ -5258,6 +5261,20 @@ class SQLCompiler(Compiled):
         ]
 
         return "RETURNING " + ", ".join(columns)
+
+    def _validate_dml_returning(
+        self, stmt: UpdateBase, has_extra_froms: bool
+    ) -> None:
+        if self.dialect.returning_supported_for_dml(
+            stmt, has_extra_froms=has_extra_froms
+        ):
+            return
+
+        dml_type = type(stmt).__name__.upper()
+        raise exc.CompileError(
+            f"The {self.dialect.name!r} dialect with current database "
+            f"version settings does not support RETURNING with {dml_type}"
+        )
 
     def limit_clause(self, select, **kw):
         text = ""
@@ -6350,6 +6367,7 @@ class SQLCompiler(Compiled):
                     update_stmt,
                     self.implicit_returning or update_stmt._returning,
                     populate_result_map=toplevel,
+                    has_extra_froms=bool(extra_froms),
                 )
 
         if extra_froms:
@@ -6382,6 +6400,7 @@ class SQLCompiler(Compiled):
                 update_stmt,
                 self.implicit_returning or update_stmt._returning,
                 populate_result_map=toplevel,
+                has_extra_froms=bool(extra_froms),
             )
 
         if self.ctes:
@@ -6502,6 +6521,7 @@ class SQLCompiler(Compiled):
                 delete_stmt,
                 self.implicit_returning or delete_stmt._returning,
                 populate_result_map=toplevel,
+                has_extra_froms=bool(extra_froms),
             )
 
         if extra_froms:
@@ -6534,6 +6554,7 @@ class SQLCompiler(Compiled):
                 delete_stmt,
                 self.implicit_returning or delete_stmt._returning,
                 populate_result_map=toplevel,
+                has_extra_froms=bool(extra_froms),
             )
 
         if self.ctes:

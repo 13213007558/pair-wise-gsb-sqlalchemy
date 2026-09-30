@@ -1369,6 +1369,8 @@ class OracleCompiler(compiler.SQLCompiler):
     def returning_clause(
         self, stmt, returning_cols, *, populate_result_map, **kw
     ):
+        has_extra_froms = kw.pop("has_extra_froms", False)
+        self._validate_dml_returning(stmt, has_extra_froms)
         columns = []
         binds = []
 

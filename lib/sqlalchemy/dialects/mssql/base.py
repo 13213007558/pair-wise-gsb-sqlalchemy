@@ -2323,6 +2323,9 @@ class MSSQLCompiler(compiler.SQLCompiler):
     def returning_clause(
         self, stmt, returning_cols, *, populate_result_map, **kw
     ):
+        has_extra_froms = kw.pop("has_extra_froms", False)
+        self._validate_dml_returning(stmt, has_extra_froms)
+
         # SQL server returning clause requires that the columns refer to
         # the virtual table names "inserted" or "deleted".   Here, we make
         # a simple alias of our table with that name, and then adapt the

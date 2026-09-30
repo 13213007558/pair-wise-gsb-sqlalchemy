@@ -1,6 +1,7 @@
 import itertools
 
 from sqlalchemy import Boolean
+from sqlalchemy import Computed
 from sqlalchemy import column
 from sqlalchemy import delete
 from sqlalchemy import exc as sa_exc
@@ -15,6 +16,8 @@ from sqlalchemy import table
 from sqlalchemy import testing
 from sqlalchemy import type_coerce
 from sqlalchemy import update
+from sqlalchemy.engine import default as engine_default
+from sqlalchemy.engine.cursor import CursorFetchStrategy
 from sqlalchemy.sql import crud
 from sqlalchemy.sql.sqltypes import NullType
 from sqlalchemy.testing import assert_raises_message
@@ -47,6 +50,35 @@ class ReturnCombinationTests(fixtures.TestBase, AssertsCompiledSQL):
             Column("x", Integer),
             Column("y", Integer),
         )
+
+    @testing.combinations(insert, update, delete, argnames="construct")
+    def test_unsupported_dialect_rejects_returning(
+        self, table_fixture, construct
+    ):
+        dialect = engine_default.DefaultDialect()
+        statement = construct(table_fixture).returning(table_fixture.c.id)
+
+        assert_raises_message(
+            sa_exc.CompileError,
+            r"does not support RETURNING",
+            statement.compile,
+            dialect=dialect,
+        )
+
+    def test_fetch_strategy_exception_hard_closes_result(self, table_fixture):
+        result = mock.Mock()
+        result.closed = False
+        result.connection._handle_dbapi_exception.side_effect = RuntimeError(
+            "fetch failed"
+        )
+        cursor = mock.Mock()
+
+        with expect_raises_message(RuntimeError, "fetch failed"):
+            CursorFetchStrategy().handle_exception(
+                result, cursor, RuntimeError("fetch failed")
+            )
+
+        result._soft_close.assert_called_once_with(hard=True)
 
     @testing.combinations(
         (
@@ -506,6 +538,188 @@ class InsertReturningTest(fixtures.TablesTest, AssertsExecutionResults):
             % (quote, quote, literal_true)
         )
         eq_([dict(row._mapping) for row in result4], [{"persons": 10}])
+
+
+class SQLiteReturningSemanticsTest(fixtures.TablesTest):
+    __requires__ = ("sqlite",)
+    __backend__ = True
+    run_create_tables = "each"
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "returning_semantics",
+            metadata,
+            Column("a", Integer, primary_key=True, autoincrement=False),
+            Column("b", Integer, primary_key=True, autoincrement=False),
+            Column("data", String(20)),
+            Column("server_value", String(20), server_default="default"),
+            Column(
+                "generated_value",
+                Integer,
+                Computed("length(coalesce(data, ''))"),
+            ),
+            Column("trigger_value", String(20), server_default="before"),
+        )
+
+    @classmethod
+    def insert_data(cls, connection):
+        connection.exec_driver_sql(
+            "CREATE TRIGGER returning_semantics_after_trigger "
+            "AFTER INSERT ON returning_semantics "
+            "BEGIN "
+            "UPDATE returning_semantics SET trigger_value = 'triggered' "
+            "WHERE a = new.a AND b = new.b; "
+            "END"
+        )
+
+    def test_batch_columns_rowcount_freezing_and_close(self, connection):
+        table = self.tables.returning_semantics
+        stmt = table.insert().returning(
+            table.c.a,
+            table.c.b,
+            table.c.server_value,
+            table.c.trigger_value,
+            table.c.generated_value,
+            func.length(table.c.data),
+        )
+
+        result = connection.execute(
+            stmt,
+            [
+                {"a": 1, "b": 10, "data": "one"},
+                {"a": 2, "b": 20, "data": "two"},
+            ],
+        )
+
+        eq_(
+            list(result.keys()),
+            [
+                "a",
+                "b",
+                "server_value",
+                "trigger_value",
+                "generated_value",
+                "length_1",
+            ],
+        )
+        eq_(result.rowcount, -1)
+        first = result.fetchone()
+        is_true(result.cursor is not None)
+        eq_(first, (1, 10, "default", "before", 3, 3))
+        frozen = result.freeze()
+        is_true(result._soft_closed)
+        is_(result.cursor, None)
+        eq_(
+            frozen().all(),
+            [(2, 20, "default", "before", 3, 3)],
+        )
+        post_trigger_rows = connection.execute(
+            select(table.c.trigger_value).where(
+                table.c.a == first.a, table.c.b == first.b
+            )
+        ).all()
+        eq_(post_trigger_rows, [("triggered",)])
+
+    def test_preserve_rowcount_keeps_batch_count(self, connection):
+        table = self.tables.returning_semantics
+        result = connection.execution_options(preserve_rowcount=True).execute(
+            table.insert().returning(table.c.a, table.c.b),
+            [{"a": 3, "b": 30}, {"a": 4, "b": 40}],
+        )
+
+        eq_(result.all(), [(3, 30), (4, 40)])
+        eq_(result.rowcount, 2)
+
+    def test_no_returned_rows_keeps_result_identity(self, connection):
+        table = self.tables.returning_semantics
+        result = connection.execute(
+            table.update()
+            .where(table.c.a == 99)
+            .values(data="missing")
+            .returning(table.c.a, table.c.b)
+        )
+
+        is_true(result.returns_rows)
+        eq_(list(result.keys()), ["a", "b"])
+        eq_(result.all(), [])
+        eq_(result.rowcount, -1)
+        is_true(result._soft_closed)
+        is_(result.cursor, None)
+
+    def test_partial_consumption_closed_by_rollback(self, connection):
+        table = self.tables.returning_semantics
+        result = connection.execute(
+            table.insert().returning(table.c.a),
+            [
+                {"a": 5, "b": 50},
+                {"a": 6, "b": 60},
+                {"a": 7, "b": 70},
+            ],
+        )
+        eq_(result.fetchone(), (5,))
+
+        connection.rollback()
+
+        is_true(result.closed)
+        count = connection.execute(
+            select(func.count()).select_from(table)
+        ).scalar()
+        eq_(count, 0)
+
+
+class SQLiteORMReturningSemanticsTest(fixtures.TablesTest):
+    __requires__ = ("sqlite",)
+    __backend__ = True
+    run_create_tables = "each"
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "orm_returning_semantics",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", String(20)),
+            Column("server_value", String(20), server_default="default"),
+        )
+
+    @testing.fixture
+    def mapped_type(self):
+        from sqlalchemy.orm import DeclarativeBase
+        from sqlalchemy.orm import registry
+
+        reg = registry(
+            metadata=self.tables.orm_returning_semantics.metadata
+        )
+
+        class Base(DeclarativeBase):
+            registry = reg
+
+        class Thing(Base):
+            __table__ = self.tables.orm_returning_semantics
+
+        return Thing
+
+    def test_flush_and_explicit_extra_column(self, connection, mapped_type):
+        from sqlalchemy import literal
+        from sqlalchemy.orm import Session
+
+        with Session(connection) as session:
+            thing = mapped_type(data="one")
+            session.add(thing)
+            session.flush()
+
+            eq_(thing.server_value, "default")
+
+            row = session.execute(
+                insert(mapped_type)
+                .values(data="two")
+                .returning(mapped_type, literal("extra"))
+            ).one()
+
+            eq_(row[0].server_value, "default")
+            eq_(row[1], "extra")
+            assert not hasattr(row[0], "anon_1")
 
 
 class UpdateReturningTest(fixtures.TablesTest, AssertsExecutionResults):

@@ -590,6 +590,9 @@ class AsyncAdapt_psycopg_cursor:
         # Normal cursor just call _close() in a non-sync way.
         self._cursor._close()
 
+    async def _async_soft_close(self) -> None:
+        return
+
     def execute(self, query, params=None, **kw):
         result = self.await_(self._cursor.execute(query, params, **kw))
         # sqlalchemy result is not async, so need to pull all rows here

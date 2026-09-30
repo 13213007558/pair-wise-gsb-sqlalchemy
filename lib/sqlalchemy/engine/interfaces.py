@@ -1012,6 +1012,12 @@ class Dialect(EventTarget):
 
     """
 
+    def returning_supported_for_dml(
+        self,
+        statement: "Any",
+        has_extra_froms: bool = False,
+    ) -> bool: ...
+
     favor_returning_over_lastrowid: bool
     """for backends that support both a lastrowid and a RETURNING insert
     strategy, favor RETURNING for simple single-int pk inserts.

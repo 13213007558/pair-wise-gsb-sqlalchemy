@@ -152,6 +152,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         self._transaction = self._nested_transaction = None
         self.__savepoint_seq = 0
         self.__in_begin = False
+        self._open_results: set["CursorResult[Any]"] = set()
 
         self.__can_reconnect = _allow_revalidate
         self._allow_autobegin = _allow_autobegin
@@ -1105,11 +1106,26 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         finally:
             self.__in_begin = False
 
+    def _register_result(self, result: "CursorResult[Any]") -> None:
+        self._open_results.add(result)
+
+    def _unregister_result(self, result: "CursorResult[Any]") -> None:
+        self._open_results.discard(result)
+
+    def _close_open_results(self) -> None:
+        for result in list(self._open_results):
+            cursor = result.cursor
+            try:
+                result._soft_close(hard=True)
+            except BaseException:
+                self._safe_close_cursor(cursor)
+
     def _rollback_impl(self) -> None:
         if self._has_events or self.engine._has_events:
             self.dispatch.rollback(self)
 
         if self._still_open_and_dbapi_connection_is_valid:
+            self._close_open_results()
             if self._echo:
                 if self._is_autocommit_isolation():
                     if self.dialect.skip_autocommit_rollback:
@@ -1161,6 +1177,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             self.dispatch.rollback_savepoint(self, name, None)
 
         if self._still_open_and_dbapi_connection_is_valid:
+            self._close_open_results()
             self.engine.dialect.do_rollback_to_savepoint(self, name)
 
     def _release_savepoint_impl(self, name: str) -> None:
@@ -1198,6 +1215,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             self.dispatch.rollback_twophase(self, xid, is_prepared)
 
         if self._still_open_and_dbapi_connection_is_valid:
+            self._close_open_results()
             assert isinstance(self._transaction, TwoPhaseTransaction)
             try:
                 self.engine.dialect.do_rollback_twophase(

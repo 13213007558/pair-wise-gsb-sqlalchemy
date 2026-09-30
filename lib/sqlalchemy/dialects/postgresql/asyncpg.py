@@ -504,6 +504,9 @@ class AsyncAdapt_asyncpg_cursor:
     def close(self):
         self._rows.clear()
 
+    async def _async_soft_close(self) -> None:
+        return
+
     def _handle_exception(self, error):
         self._adapt_connection._handle_exception(error)
 

@@ -495,6 +495,26 @@ class DefaultDialect(Dialect):
         """
         return self.supports_sane_rowcount
 
+    def returning_supported_for_dml(
+        self,
+        statement: dml.UpdateBase,
+        has_extra_froms: bool = False,
+    ) -> bool:
+        """Return whether RETURNING is supported for this DML statement."""
+
+        if isinstance(statement, dml.Insert):
+            return self.insert_returning
+        elif isinstance(statement, dml.Update):
+            return self.update_returning and (
+                self.update_returning_multifrom or not has_extra_froms
+            )
+        elif isinstance(statement, dml.Delete):
+            return self.delete_returning and (
+                self.delete_returning_multifrom or not has_extra_froms
+            )
+        else:
+            return False
+
     @classmethod
     def get_pool_class(cls, url: URL) -> Type[Pool]:
         return getattr(cls, "poolclass", pool.QueuePool)
@@ -1917,6 +1937,14 @@ class DefaultExecutionContext(ExecutionContext):
         compiled = cast(SQLCompiler, self.compiled)
 
         strategy: ResultFetchStrategy = self.cursor_fetch_strategy
+
+        if (
+            self._is_explicit_returning
+            and self._rowcount is None
+            and not self.execution_options.get("preserve_rowcount", False)
+            and not self.dialect.supports_sane_rowcount_returning
+        ):
+            self._rowcount = -1
 
         if self.isinsert:
             if (

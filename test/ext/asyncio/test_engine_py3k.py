@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import inspect as stdlib_inspect
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sqlalchemy import AssertionPool
@@ -52,6 +53,30 @@ from sqlalchemy.testing import is_true
 from sqlalchemy.testing import mock
 from sqlalchemy.testing import ne_
 from sqlalchemy.util import greenlet_spawn
+
+
+class AsyncResultCursorCloseTest(fixtures.TestBase):
+    def test_ensure_sync_result_soft_closes_cursor(self):
+        from sqlalchemy.ext.asyncio.result import _ensure_sync_result
+
+        class FakeCursor:
+            closed = False
+
+            async def _async_soft_close(self):
+                self.closed = True
+
+        class FakeResult:
+            _is_cursor = True
+            cursor = FakeCursor()
+            context = SimpleNamespace(_is_server_side=False)
+
+        result = FakeResult()
+
+        async def run_test():
+            await _ensure_sync_result(result, None)
+
+        asyncio.new_event_loop().run_until_complete(run_test())
+        is_true(result.cursor.closed)
 
 
 class AsyncFixture:
