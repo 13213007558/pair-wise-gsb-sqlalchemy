@@ -1946,6 +1946,14 @@ class DefaultExecutionContext(ExecutionContext):
                 self.cursor, self.execution_options
             )
 
+        if (
+            self._is_explicit_returning
+            and strategy is _cursor._DEFAULT_FETCH
+            and not self._is_server_side
+            and not self.execution_options.get("stream_results", False)
+        ):
+            strategy = _cursor.FullyBufferedCursorFetchStrategy(self.cursor)
+
         if strategy is _cursor._NO_CURSOR_DML:
             cursor_description = None
         else:
@@ -1973,6 +1981,7 @@ class DefaultExecutionContext(ExecutionContext):
                 rows = result.all()
 
                 self.returned_default_rows = rows
+                self._rowcount = len(rows)
 
                 self.inserted_primary_key_rows = (
                     self._setup_ins_pk_from_implicit_returning(result, rows)
@@ -2023,7 +2032,7 @@ class DefaultExecutionContext(ExecutionContext):
                 self._rowcount = self.cursor.rowcount
             result._soft_close()
         elif self.isupdate or self.isdelete:
-            if self._rowcount is None:
+            if not self._is_explicit_returning and self._rowcount is None:
                 self._rowcount = self.cursor.rowcount
         return result
 

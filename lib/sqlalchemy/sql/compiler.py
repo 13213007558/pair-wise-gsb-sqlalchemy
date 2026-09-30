@@ -5259,6 +5259,27 @@ class SQLCompiler(Compiled):
 
         return "RETURNING " + ", ".join(columns)
 
+    def _validate_dml_returning_support(self, stmt: UpdateBase) -> None:
+        if not stmt._returning:
+            return
+
+        if self.isinsert:
+            capability = self.dialect.insert_returning
+            statement_type = "INSERT"
+        elif self.isupdate:
+            capability = self.dialect.update_returning
+            statement_type = "UPDATE"
+        else:
+            capability = self.dialect.delete_returning
+            statement_type = "DELETE"
+
+        if not capability:
+            raise exc.CompileError(
+                f"The {self.dialect.dialect_description} dialect with "
+                f"current database version settings does not support "
+                f"{statement_type}..RETURNING"
+            )
+
     def limit_clause(self, select, **kw):
         text = ""
         if select._limit_clause is not None:
@@ -5977,6 +5998,8 @@ class SQLCompiler(Compiled):
         implicit_sentinel = False
 
         returning_cols = self.implicit_returning or insert_stmt._returning
+        if insert_stmt._returning:
+            self._validate_dml_returning_support(insert_stmt)
         if returning_cols:
             add_sentinel_cols = crud_params_struct.use_sentinel_columns
             if add_sentinel_cols is not None:
@@ -6344,6 +6367,9 @@ class SQLCompiler(Compiled):
             )
         )
 
+        if update_stmt._returning:
+            self._validate_dml_returning_support(update_stmt)
+
         if self.implicit_returning or update_stmt._returning:
             if self.returning_precedes_values:
                 text += " " + self.returning_clause(
@@ -6498,6 +6524,7 @@ class SQLCompiler(Compiled):
         if (
             self.implicit_returning or delete_stmt._returning
         ) and self.returning_precedes_values:
+            self._validate_dml_returning_support(delete_stmt)
             text += " " + self.returning_clause(
                 delete_stmt,
                 self.implicit_returning or delete_stmt._returning,
@@ -6530,6 +6557,7 @@ class SQLCompiler(Compiled):
         if (
             self.implicit_returning or delete_stmt._returning
         ) and not self.returning_precedes_values:
+            self._validate_dml_returning_support(delete_stmt)
             text += " " + self.returning_clause(
                 delete_stmt,
                 self.implicit_returning or delete_stmt._returning,

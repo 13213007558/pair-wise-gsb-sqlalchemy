@@ -1,5 +1,7 @@
 import itertools
 
+from sqlalchemy.engine import default
+from sqlalchemy.engine import cursor as _cursor
 from sqlalchemy import Boolean
 from sqlalchemy import column
 from sqlalchemy import delete
@@ -70,6 +72,48 @@ class ReturnCombinationTests(fixtures.TestBase, AssertsCompiledSQL):
         self.assert_compile(
             stmt,
             "%s RETURNING foo.x, foo.y" % (sql_frag),
+        )
+
+    @testing.combinations(
+        (insert, "insert_returning"),
+        (update, "update_returning"),
+        (delete, "delete_returning"),
+        argnames="dml_fn, flag",
+        id_="na",
+    )
+    def test_returning_rejected_by_dialect(self, table_fixture, dml_fn, flag):
+        t = table_fixture
+        stmt = dml_fn(t).returning(t.c.x)
+        dialect = default.DefaultDialect()
+
+        assert not getattr(dialect, flag)
+        assert_raises_message(
+            sa_exc.CompileError,
+            "The default dialect with current database version settings "
+            "does not support",
+            stmt.compile,
+            dialect=dialect,
+        )
+
+    @testing.combinations(
+        (insert, "insert_returning"),
+        (update, "update_returning"),
+        (delete, "delete_returning"),
+        argnames="dml_fn, flag",
+        id_="na",
+    )
+    def test_returning_rejected_by_version(self, table_fixture, dml_fn, flag):
+        t = table_fixture
+        stmt = dml_fn(t).returning(t.c.x)
+        dialect = default.DefaultDialect()
+        setattr(dialect, flag, False)
+
+        assert_raises_message(
+            sa_exc.CompileError,
+            "The default dialect with current database version settings "
+            "does not support",
+            stmt.compile,
+            dialect=dialect,
         )
 
     def test_return_no_return_defaults(self, table_fixture):

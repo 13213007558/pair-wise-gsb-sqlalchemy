@@ -1287,7 +1287,11 @@ class FullyBufferedCursorFetchStrategy(CursorFetchStrategy):
 
     """
 
-    __slots__ = ("_rowbuffer", "alternate_cursor_description")
+    __slots__ = (
+        "_rowbuffer",
+        "_initial_rowcount",
+        "alternate_cursor_description",
+    )
 
     def __init__(
         self,
@@ -1301,15 +1305,25 @@ class FullyBufferedCursorFetchStrategy(CursorFetchStrategy):
         else:
             assert dbapi_cursor is not None
             self._rowbuffer = collections.deque(dbapi_cursor.fetchall())
+        self._initial_rowcount = len(self._rowbuffer)
+
+    def _set_returned_rowcount(self, result):
+        if (
+            result.context._is_explicit_returning
+            and result.context._rowcount is None
+        ):
+            result.context._rowcount = self._initial_rowcount
 
     def yield_per(self, result, dbapi_cursor, num):
         pass
 
     def soft_close(self, result, dbapi_cursor):
+        self._set_returned_rowcount(result)
         self._rowbuffer.clear()
         super().soft_close(result, dbapi_cursor)
 
     def hard_close(self, result, dbapi_cursor):
+        self._set_returned_rowcount(result)
         self._rowbuffer.clear()
         super().hard_close(result, dbapi_cursor)
 
@@ -1331,8 +1345,7 @@ class FullyBufferedCursorFetchStrategy(CursorFetchStrategy):
         return rows
 
     def fetchall(self, result, dbapi_cursor):
-        ret = self._rowbuffer
-        self._rowbuffer = collections.deque()
+        ret = list(self._rowbuffer)
         result._soft_close()
         return ret
 
