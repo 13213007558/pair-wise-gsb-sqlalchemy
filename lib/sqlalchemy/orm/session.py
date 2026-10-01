@@ -1365,6 +1365,13 @@ class SessionTransaction(_StateChange, TransactionalContext):
                         rollback_err = sys.exc_info()
                     finally:
                         transaction._state = SessionTransactionState.DEACTIVE
+                        if rollback_err and transaction._parent is not None:
+                            transaction._parent._state = (
+                                SessionTransactionState.DEACTIVE
+                            )
+                            transaction._parent._rollback_exception = (
+                                rollback_err[1]
+                            )
                         transaction._restore_snapshot(
                             dirty_only=transaction.nested
                         )

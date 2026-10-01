@@ -2828,15 +2828,22 @@ class NestedTransaction(Transaction):
     def _close_impl(
         self, deactivate_from_connection: bool, warn_already_deactive: bool
     ) -> None:
+        parent_transaction = self.connection._transaction
+        rollback_failed = False
         try:
             if (
                 self.is_active
-                and self.connection._transaction
-                and self.connection._transaction.is_active
+                and parent_transaction
+                and parent_transaction.is_active
             ):
                 self.connection._rollback_to_savepoint_impl(self._savepoint)
+        except:
+            rollback_failed = True
+            raise
         finally:
             self.is_active = False
+            if rollback_failed and parent_transaction is not None:
+                parent_transaction.is_active = False
 
             if deactivate_from_connection:
                 self._deactivate_from_connection(warn=warn_already_deactive)

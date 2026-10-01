@@ -13,6 +13,17 @@
     :released: August 11, 2025
 
     .. change::
+        :tags: bug, orm, engine
+
+        Fixed rollback handling for a nested :class:`.SessionTransaction`
+        when the database ``ROLLBACK TO SAVEPOINT`` statement itself fails
+        inside an enclosing SAVEPOINT. The enclosing Core and ORM transactions
+        are now immediately deactivated, preventing continued use of the
+        failed transaction and allowing :meth:`_orm.Session.rollback` to
+        perform the outermost database rollback without re-emitting the
+        failed SAVEPOINT statement.
+
+    .. change::
         :tags: usecase, oracle
         :tickets: 12711
 

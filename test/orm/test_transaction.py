@@ -5,6 +5,7 @@ import random
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from sqlalchemy import create_engine
 from sqlalchemy import event
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import func
@@ -30,12 +31,14 @@ from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import assert_warnings
 from sqlalchemy.testing import engines
 from sqlalchemy.testing import eq_
+from sqlalchemy.testing import expect_raises
 from sqlalchemy.testing import expect_raises_message
 from sqlalchemy.testing import expect_warnings
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import is_
 from sqlalchemy.testing import is_not
 from sqlalchemy.testing import mock
+from sqlalchemy.testing.assertions import not_in
 from sqlalchemy.testing.config import Variation
 from sqlalchemy.testing.fixtures import fixture_session
 from sqlalchemy.testing.schema import Column
@@ -396,6 +399,285 @@ class SessionTransactionTest(fixtures.RemovesEvents, FixtureTest):
             nt1.rollback()
             assert attributes.instance_state(u1).expired
             eq_(u1.name, "u1")
+
+    @testing.combinations(True, False, argnames="expire_on_commit")
+    def test_failed_inner_savepoint_recovers_within_outer_savepoint(
+        self, expire_on_commit
+    ):
+        users, User = self.tables.users, self.classes.User
+        self.mapper_registry.map_imperatively(User, users)
+
+        engine = create_engine("sqlite://")
+        try:
+            users.create(engine)
+            with Session(engine, expire_on_commit=False) as setup:
+                setup.add(User(id=1, name="base"))
+                setup.commit()
+
+            timeline = []
+
+            with Session(
+                engine, expire_on_commit=expire_on_commit
+            ) as session:
+
+                @event.listens_for(session, "after_transaction_create")
+                def after_transaction_create(session, transaction):
+                    if (
+                        transaction.origin
+                        is not _session.SessionTransactionOrigin.SUBTRANSACTION
+                    ):
+                        timeline.append(
+                            (
+                                "create",
+                                transaction.nested,
+                                transaction.origin.name,
+                            )
+                        )
+
+                @event.listens_for(session, "after_transaction_end")
+                def after_transaction_end(session, transaction):
+                    if (
+                        transaction.origin
+                        is not _session.SessionTransactionOrigin.SUBTRANSACTION
+                    ):
+                        timeline.append(
+                            (
+                                "end",
+                                transaction.nested,
+                                transaction.origin.name,
+                            )
+                        )
+
+                @event.listens_for(session, "after_rollback")
+                def after_rollback(session):
+                    timeline.append(("rollback", None, None))
+
+                @event.listens_for(session, "after_commit")
+                def after_commit(session):
+                    timeline.append(("commit", None, None))
+
+                session.begin()
+                existing = session.get(User, 1)
+
+                outer = session.begin_nested()
+                outer_new = User(id=2, name="outer")
+                session.add(outer_new)
+                existing.name = "outer"
+                session.flush()
+
+                inner = session.begin_nested()
+                inner_new = User(id=3, name="inner")
+                session.add(inner_new)
+                existing.name = "inner"
+                session.add(User(id=1, name="duplicate"))
+
+                with expect_warnings("New instance"):
+                    assert_raises(sa_exc.IntegrityError, session.flush)
+
+                with expect_raises(sa_exc.PendingRollbackError):
+                    session.execute(select(User.id))
+                with expect_raises(sa_exc.PendingRollbackError):
+                    session.commit()
+
+                inner.rollback()
+
+                is_(session.get_nested_transaction(), outer)
+                is_not(inner_new, session)
+                is_(session.get(User, 1), existing)
+                eq_(existing.name, "outer")
+                is_(session.get(User, 2), outer_new)
+                assert existing not in session.dirty
+
+                existing.name = "recovered"
+                eq_(
+                    session.execute(
+                        select(User.name).where(User.id == 1)
+                    ).scalar_one(),
+                    "recovered",
+                )
+                session.commit()
+                if not expire_on_commit:
+                    eq_(existing.name, "recovered")
+                    eq_(outer_new.name, "outer")
+
+            with engine.connect() as connection:
+                eq_(
+                    connection.execute(
+                        select(User.id, User.name).order_by(User.id)
+                    ).all(),
+                    [(1, "recovered"), (2, "outer")],
+                )
+
+            eq_(
+                timeline,
+                [
+                    ("create", False, "BEGIN"),
+                    ("create", True, "BEGIN_NESTED"),
+                    ("create", True, "BEGIN_NESTED"),
+                    ("rollback", None, None),
+                    ("end", True, "BEGIN_NESTED"),
+                    ("commit", None, None),
+                    ("end", True, "BEGIN_NESTED"),
+                    ("commit", None, None),
+                    ("end", False, "BEGIN"),
+                ],
+            )
+        finally:
+            engine.dispose()
+
+    def test_expired_state_reloads_value_after_savepoint_rollback(self):
+        users, User = self.tables.users, self.classes.User
+        self.mapper_registry.map_imperatively(User, users)
+
+        engine = create_engine("sqlite://")
+        try:
+            users.create(engine)
+            with Session(engine, expire_on_commit=False) as setup:
+                setup.add(User(id=1, name="base"))
+                setup.commit()
+
+            with Session(engine, expire_on_commit=False) as session:
+                existing = session.get(User, 1)
+                savepoint = session.begin_nested()
+                existing.name = "savepoint"
+                session.flush()
+                savepoint.rollback()
+
+                with engine.begin() as connection:
+                    connection.execute(
+                        users.update()
+                        .where(users.c.id == 1)
+                        .values(name="database-new")
+                    )
+                eq_(existing.name, "database-new")
+
+                existing.name = "application-new"
+                eq_(
+                    session.execute(
+                        select(User.name).where(User.id == 1)
+                    ).scalar_one(),
+                    "application-new",
+                )
+                session.commit()
+
+            with engine.connect() as connection:
+                eq_(
+                    connection.execute(select(User.name)).scalar_one(),
+                    "application-new",
+                )
+        finally:
+            engine.dispose()
+
+    def test_committed_inner_savepoint_rolls_back_with_outer_savepoint(self):
+        users, User = self.tables.users, self.classes.User
+        self.mapper_registry.map_imperatively(User, users)
+
+        engine = create_engine("sqlite://")
+        try:
+            users.create(engine)
+            with Session(engine, expire_on_commit=False) as setup:
+                setup.add_all(
+                    [
+                        User(id=1, name="base"),
+                        User(id=2, name="deleted"),
+                        User(id=3, name="outer"),
+                    ]
+                )
+                setup.commit()
+
+            with Session(engine, expire_on_commit=False) as session:
+                session.begin()
+                existing = session.get(User, 1)
+                deleted = session.get(User, 2)
+                outer_new = session.get(User, 3)
+
+                outer = session.begin_nested()
+                inner = session.begin_nested()
+                existing.name = "inner"
+                inner_new = User(id=4, name="inner-new")
+                session.add(inner_new)
+                session.delete(deleted)
+                inner.commit()
+
+                is_(session.get(User, 2), None)
+                is_(session.get(User, 4), inner_new)
+                eq_(existing.name, "inner")
+
+                outer.rollback()
+
+                is_(session.get(User, 1), existing)
+                is_(session.get(User, 2), deleted)
+                is_(session.get(User, 3), outer_new)
+                is_(session.get(User, 4), None)
+                not_in(inner_new, session)
+                eq_(existing.name, "base")
+                eq_(deleted.name, "deleted")
+
+                session.rollback()
+
+            with engine.connect() as connection:
+                eq_(
+                    connection.execute(select(User.id).order_by(User.id)).all(),
+                    [(1,), (2,), (3,)],
+                )
+        finally:
+            engine.dispose()
+
+    def test_failed_inner_savepoint_rollback_deactivates_outer_savepoint(self):
+        users, User = self.tables.users, self.classes.User
+        self.mapper_registry.map_imperatively(User, users)
+
+        engine = create_engine("sqlite://")
+        try:
+            users.create(engine)
+            with Session(engine) as setup:
+                setup.add(User(id=1, name="base"))
+                setup.commit()
+
+            rollback_error = engine.dialect.dbapi.OperationalError(
+                "Can't roll back to savepoint"
+            )
+
+            def prevent_savepoint_rollback(
+                cursor, statement, parameters, context=None
+            ):
+                if (
+                    context is not None
+                    and context.compiled
+                    and isinstance(
+                        context.compiled.statement,
+                        elements.RollbackToSavepointClause,
+                    )
+                ):
+                    raise rollback_error
+
+            self.event_listen(
+                engine.dialect,
+                "do_execute",
+                prevent_savepoint_rollback,
+                insert=True,
+            )
+
+            with Session(engine) as session:
+                session.begin()
+                outer = session.begin_nested()
+                inner = session.begin_nested()
+                session.add(User(id=1, name="duplicate"))
+
+                with expect_raises(sa_exc.OperationalError):
+                    session.flush()
+
+                eq_(inner._state, _session.DEACTIVE)
+                eq_(outer._state, _session.DEACTIVE)
+                eq_(session.is_active, False)
+
+                with expect_raises(sa_exc.PendingRollbackError):
+                    session.execute(select(1))
+
+                session.rollback()
+                is_(session._transaction, None)
+        finally:
+            engine.dispose()
 
     @testing.requires.independent_connections
     def test_transactions_isolated(self):

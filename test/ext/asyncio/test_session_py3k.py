@@ -698,6 +698,64 @@ class AsyncSessionTransactionTest(AsyncFixture):
             eq_(result.all(), [])
 
     @async_test
+    async def test_failed_inner_savepoint_recovers_outer_savepoint(
+        self, async_engine
+    ):
+        User = self.classes.User
+
+        async with async_engine.begin() as conn:
+            await conn.execute(
+                User.__table__.insert().values(id=1, name="u1")
+            )
+
+        async with AsyncSession(
+            async_engine, expire_on_commit=False
+        ) as async_session:
+            async with async_session.begin():
+                existing = await async_session.get(User, 1)
+
+                outer = await async_session.begin_nested()
+                outer_new = User(id=2, name="outer")
+                async_session.add(outer_new)
+                existing.name = "outer"
+                await async_session.flush()
+
+                inner = await async_session.begin_nested()
+                inner_new = User(id=3, name="inner")
+                async_session.add(inner_new)
+                existing.name = "inner"
+                async_session.add(User(id=1, name="duplicate"))
+
+                with testing.expect_raises(exc.IntegrityError):
+                    await async_session.flush()
+
+                with testing.expect_raises(exc.PendingRollbackError):
+                    await async_session.execute(select(User.id))
+
+                await inner.rollback()
+
+                is_(
+                    async_session.sync_session.get_nested_transaction(),
+                    outer.sync_transaction,
+                )
+                not_in(inner_new, async_session)
+                is_(await async_session.get(User, 1), existing)
+                eq_(existing.name, "outer")
+                is_(await async_session.get(User, 2), outer_new)
+
+                existing.name = "recovered"
+
+        async with async_engine.connect() as conn:
+            eq_(
+                (
+                    await conn.execute(
+                        select(User.id, User.name).order_by(User.id)
+                    )
+                ).all(),
+                [(1, "recovered"), (2, "outer")],
+            )
+
+    @async_test
     @testing.requires.independent_connections
     async def test_invalidate(self, async_session):
         await async_session.execute(select(1))
