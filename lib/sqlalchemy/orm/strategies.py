@@ -55,6 +55,7 @@ from .. import inspect
 from .. import log
 from .. import sql
 from .. import util
+from ..sql import operators
 from ..sql import util as sql_util
 from ..sql import visitors
 from ..sql.selectable import LABEL_STYLE_TABLENAME_PLUS_COL
@@ -3013,6 +3014,64 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
             )
         return user_input
 
+    @classmethod
+    def _set_per_parent_limit(cls, loadopt) -> Optional[int]:
+        if loadopt is None:
+            return None
+
+        user_input = loadopt.local_opts.get("per_parent_limit", None)
+        if user_input is None:
+            return None
+        elif (
+            not isinstance(user_input, int)
+            or isinstance(user_input, bool)
+            or user_input < 0
+        ):
+            raise sa_exc.ArgumentError(
+                f"'per_parent_limit={user_input}' is not an appropriate "
+                "input, please use a positive non-zero integer, or zero."
+            )
+        return user_input
+
+    # minimum database versions that support the ROW_NUMBER() window
+    # function, which is used to implement per-parent limiting
+    _window_function_min_versions = {
+        "sqlite": (3, 25, 0),
+        "mysql": (8, 0, 0),
+        "mariadb": (10, 2, 0),
+    }
+
+    @classmethod
+    def _assert_per_parent_limit_supported(cls, dialect) -> None:
+        if not getattr(dialect, "supports_window_functions", True):
+            raise sa_exc.InvalidRequestError(
+                "The selectinload() per_parent_limit option requires window "
+                "functions (ROW_NUMBER()), but the %r dialect does not "
+                "support this SQL feature." % dialect.name
+            )
+
+        min_version = cls._window_function_min_versions.get(dialect.name)
+        version_info = getattr(dialect, "server_version_info", None)
+        if min_version is not None and version_info is not None:
+            # version tuples may contain non-integer components (e.g. None
+            # for an unknown version); only gate when the version can be
+            # compared reliably.
+            current = tuple(version_info[: len(min_version)])
+            if len(current) == len(min_version) and all(
+                isinstance(component, int) for component in current
+            ) and current < min_version:
+                raise sa_exc.InvalidRequestError(
+                    "The selectinload() per_parent_limit option requires "
+                    "window functions (ROW_NUMBER()), but the %r backend "
+                    "version %s is too old; version %s or newer is "
+                    "required."
+                    % (
+                        dialect.name,
+                        ".".join(str(v) for v in current),
+                        ".".join(str(v) for v in min_version),
+                    )
+                )
+
     def __init__(self, parent, strategy_key):
         super().__init__(parent, strategy_key)
         self.join_depth = self.parent_property.join_depth
@@ -3403,7 +3462,46 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
 
         chunksize = self._set_chunksize(loadopt)
 
-        if query_info.load_only_child:
+        per_parent_limit = self._set_per_parent_limit(loadopt)
+
+        if per_parent_limit is not None:
+            if not self.uselist:
+                raise sa_exc.InvalidRequestError(
+                    "The selectinload() per_parent_limit option may only "
+                    "be applied to a collection relationship; '%s' is a "
+                    "scalar reference." % self
+                )
+            if query_info.load_only_child:
+                raise sa_exc.InvalidRequestError(
+                    "The selectinload() per_parent_limit option is not "
+                    "supported for many-to-one relationships."
+                )
+
+            if per_parent_limit == 0:
+                # populate every parent with an empty collection without
+                # emitting the windowed loader SELECT
+                for key, state, state_dict, overwrite in our_states:
+                    if not overwrite and self.key in state_dict:
+                        continue
+                    state.get_impl(self.key).set_committed_value(
+                        state, state_dict, ()
+                    )
+                return
+
+            self._load_per_parent_limit(
+                our_states,
+                q,
+                context,
+                execution_options,
+                chunksize,
+                per_parent_limit,
+                new_options,
+                effective_entity,
+                query_info,
+                effective_path,
+                pk_cols,
+            )
+        elif query_info.load_only_child:
             self._load_via_child(
                 our_states,
                 none_states,
@@ -3422,6 +3520,258 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 execution_options,
                 chunksize,
             )
+
+    def _per_parent_limit_query(
+        self,
+        base_q,
+        new_options,
+        effective_entity,
+        per_parent_limit,
+        local_pk_cols,
+    ):
+        """Build the windowed SELECT used for per-parent limited loads.
+
+        The statement ranks related objects per parent using
+        ``ROW_NUMBER()`` and only joins back to the full entity row for
+        the highest-ranked rows.  A ``DISTINCT`` inner select ensures that
+        association-table fan-out (e.g. duplicate joins for a
+        many-to-many with extra join criteria) cannot cause the same ORM
+        entity to consume more than one ranking slot.
+
+        """
+        is_aliased = effective_entity.is_aliased_class
+
+        def _adapt(elem):
+            if is_aliased:
+                return effective_entity._adapt_element(elem)
+            else:
+                return elem
+
+        n_parent = len(local_pk_cols)
+        n_child = len(self.mapper.primary_key)
+
+        # order by the relationship's eager order_by, if any, appending the
+        # related entity's primary key columns as a stable tiebreaker so
+        # that results are deterministic when ordering values are equal.
+        if self.parent_property.order_by:
+            order_elements = list(
+                util.to_list(self.parent_property.order_by)
+            )
+        else:
+            order_elements = []
+
+        order_cols = []
+        for elem in order_elements:
+            order_cols.append(_adapt(elem))
+
+        # ORDER BY expressions may carry an asc/desc (or nulls first/
+        # last) modifier, which is invalid as a projected column inside
+        # the DISTINCT subquery.  Project the underlying expression and
+        # let the ROW_NUMBER() window's own ORDER BY carry the modifier.
+        order_projection_cols = []
+        for elem in order_cols:
+            if isinstance(elem, sql.elements.UnaryExpression):
+                order_projection_cols.append(elem.element)
+            else:
+                order_projection_cols.append(elem)
+
+        # only propagate loader criteria into the ranking subquery; options
+        # that affect the entity SELECT itself (e.g. nested eager loaders,
+        # column deferral) are applied to the outer query by the caller.
+        criteria_options = tuple(
+            opt
+            for opt in new_options
+            if isinstance(opt, orm_util.LoaderCriteriaOption)
+        )
+
+        # Build the ranking select directly, projecting only the parent
+        # keys, child primary keys and ordering columns over the
+        # relationship's fully-resolved FROM clause (including association
+        # table joins).  A DISTINCT applied before ROW_NUMBER() ensures that
+        # association-table fan-out cannot let one ORM entity consume more
+        # than one per-parent slot.  The relationship's eager ORDER BY is
+        # intentionally not applied to this derived table; ordering is
+        # expressed by the window function itself.
+        parent_key_cols = [
+            col.label("pp_%d" % idx)
+            for idx, col in enumerate(local_pk_cols)
+        ]
+        child_pk_cols = [
+            _adapt(col).label("cp_%d" % idx)
+            for idx, col in enumerate(self.mapper.primary_key)
+        ]
+        order_label_cols = [
+            col.label("ord_%d" % idx)
+            for idx, col in enumerate(order_projection_cols)
+        ]
+
+        inner_q = Select._create_raw_select(
+            _raw_columns=[
+                *parent_key_cols,
+                *child_pk_cols,
+                *order_label_cols,
+            ],
+            _compile_options=_ORMCompileState.default_compile_options,
+            _propagate_attrs={
+                "compile_state_plugin": "orm",
+                "plugin_subject": effective_entity,
+            },
+        )
+
+        final_from = base_q.get_final_froms()[0]
+        inner_sq = (
+            inner_q.select_from(final_from)
+            .where(*base_q._where_criteria)
+            .options(*criteria_options)
+            .distinct()
+            .subquery()
+        )
+
+        partition_by = [
+            inner_sq.c["pp_%d" % idx] for idx in range(n_parent)
+        ]
+        rank_order = []
+        for idx, elem in enumerate(order_cols):
+            label_col = inner_sq.c["ord_%d" % idx]
+            if isinstance(elem, sql.elements.UnaryExpression):
+                if elem.modifier is operators.desc_op:
+                    label_col = label_col.desc()
+                elif elem.modifier is operators.asc_op:
+                    label_col = label_col.asc()
+                else:
+                    # e.g. NULLS FIRST / NULLS LAST modifiers; rebuild
+                    # the unary expression against the projected label
+                    label_col = sql.elements.UnaryExpression(
+                        label_col, modifier=elem.modifier
+                    )
+            rank_order.append(label_col)
+        rank_order += [
+            inner_sq.c["cp_%d" % idx] for idx in range(n_child)
+        ]
+
+        ranked_sq = Select._create_raw_select(
+            _raw_columns=[
+                *[
+                    inner_sq.c["pp_%d" % idx]
+                    for idx in range(n_parent)
+                ],
+                *[
+                    inner_sq.c["cp_%d" % idx]
+                    for idx in range(n_child)
+                ],
+                sql.func.row_number()
+                .over(partition_by=partition_by, order_by=rank_order)
+                .label("rn"),
+            ],
+        ).subquery()
+
+        limited_sq = (
+            Select._create_raw_select(
+                _raw_columns=[
+                    *[
+                        ranked_sq.c["pp_%d" % idx]
+                        for idx in range(n_parent)
+                    ],
+                    *[
+                        ranked_sq.c["cp_%d" % idx]
+                        for idx in range(n_child)
+                    ],
+                    ranked_sq.c.rn,
+                ]
+            )
+            .where(
+                ranked_sq.c.rn
+                <= sql.bindparam("per_parent_limit", per_parent_limit)
+            )
+            .subquery()
+        )
+
+        entity_sql = effective_entity.__clause_element__()
+
+        # join the limited rows back to the entity table to produce the
+        # full ORM entity row.  Rows are ordered by the parent keys and the
+        # per-parent rank so that multiple batches return collections in a
+        # consistent order.
+        q = (
+            Select._create_raw_select(
+                _raw_columns=[
+                    *[
+                        limited_sq.c["pp_%d" % idx]
+                        for idx in range(n_parent)
+                    ],
+                    entity_sql,
+                ],
+                _compile_options=_ORMCompileState.default_compile_options,
+                _propagate_attrs={
+                    "compile_state_plugin": "orm",
+                    "plugin_subject": effective_entity,
+                },
+            )
+            .select_from(limited_sq)
+            .join(
+                entity_sql,
+                sql.and_(
+                    *[
+                        _adapt(pk_col)
+                        == limited_sq.c["cp_%d" % idx]
+                        for idx, pk_col in enumerate(
+                            self.mapper.primary_key
+                        )
+                    ]
+                ),
+            )
+            .order_by(
+                *[
+                    limited_sq.c["pp_%d" % idx]
+                    for idx in range(n_parent)
+                ],
+                limited_sq.c.rn,
+            )
+        )
+
+        return q
+
+    def _load_per_parent_limit(
+        self,
+        our_states,
+        base_q,
+        context,
+        execution_options,
+        chunksize,
+        per_parent_limit,
+        new_options,
+        effective_entity,
+        query_info,
+        effective_path,
+        local_pk_cols,
+    ):
+        bind = context.session.get_bind(clause=base_q)
+        self._assert_per_parent_limit_supported(bind.dialect)
+
+        q = self._per_parent_limit_query(
+            base_q,
+            new_options,
+            effective_entity,
+            per_parent_limit,
+            local_pk_cols,
+        )
+
+        # nested eager loaders and other entity-level options apply to the
+        # outer, full-entity SELECT
+        q = q.options(*new_options)
+        q = q._update_compile_options({"_current_path": effective_path})
+        if context.populate_existing:
+            q = q.execution_options(populate_existing=True)
+
+        self._load_via_parent(
+            our_states,
+            query_info,
+            q,
+            context,
+            execution_options,
+            chunksize,
+            {"per_parent_limit": per_parent_limit},
+        )
 
     def _load_via_child(
         self,
@@ -3481,7 +3831,14 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
             state.get_impl(self.key).set_committed_value(state, dict_, None)
 
     def _load_via_parent(
-        self, our_states, query_info, q, context, execution_options, chunksize
+        self,
+        our_states,
+        query_info,
+        q,
+        context,
+        execution_options,
+        chunksize,
+        extra_params=None,
     ):
         uselist = self.uselist
         n_pk = query_info.n_pk
@@ -3496,9 +3853,12 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 item[0][0] if zero_idx else item[0] for item in chunk
             ]
 
+            params = {"primary_keys": primary_keys}
+            if extra_params:
+                params.update(extra_params)
             result = context.session.execute(
                 q,
-                params={"primary_keys": primary_keys},
+                params=params,
                 execution_options=execution_options,
             )
             if result.context is not None and result.context.requires_uniquing:

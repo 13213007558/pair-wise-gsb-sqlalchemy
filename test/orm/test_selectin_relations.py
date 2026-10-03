@@ -19,6 +19,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import subqueryload
 from sqlalchemy.orm import undefer
+from sqlalchemy.orm import with_loader_criteria
 from sqlalchemy.orm import with_polymorphic
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import assert_warns
@@ -4742,3 +4743,662 @@ class SelectinM2ONoRelatedRowTest(fixtures.DeclarativeMappedTest):
 
             # NULL a_id
             is_(bs[2].a, None)
+
+
+class PerParentLimitTest(fixtures.DeclarativeMappedTest):
+    __backend__ = True
+    run_inserts = "once"
+    run_deletes = None
+
+    @classmethod
+    def setup_classes(cls):
+        Base = cls.DeclarativeBasic
+
+        class Tag(ComparableEntity, Base):
+            __tablename__ = "ppl_tag"
+            id = Column(Integer, primary_key=True)
+            name = Column(String(30))
+
+        class Parent(ComparableEntity, Base):
+            __tablename__ = "ppl_parent"
+            id = Column(Integer, primary_key=True)
+            children = relationship(
+                "Child",
+                order_by="Child.rank",
+                back_populates="parent",
+            )
+
+        class Child(ComparableEntity, Base):
+            __tablename__ = "ppl_child"
+            id = Column(Integer, primary_key=True)
+            parent_id = Column(ForeignKey("ppl_parent.id"))
+            rank = Column(Integer)
+            active = Column(Boolean, default=True)
+            tag_id = Column(ForeignKey("ppl_tag.id"))
+            parent = relationship("Parent", back_populates="children")
+            tag = relationship("Tag")
+
+        class CompositeParent(ComparableEntity, Base):
+            __tablename__ = "ppl_cparent"
+            k1 = Column(Integer, primary_key=True)
+            k2 = Column(Integer, primary_key=True)
+            kids = relationship(
+                "CompositeChild", order_by="CompositeChild.id"
+            )
+
+        class CompositeChild(ComparableEntity, Base):
+            __tablename__ = "ppl_cchild"
+            id = Column(Integer, primary_key=True)
+            f1 = Column(Integer)
+            f2 = Column(Integer)
+            __table_args__ = (
+                ForeignKeyConstraint(
+                    ["f1", "f2"], ["ppl_cparent.k1", "ppl_cparent.k2"]
+                ),
+            )
+
+    @classmethod
+    def insert_data(cls, connection):
+        Parent, Child, Tag = cls.classes("Parent", "Child", "Tag")
+        CompositeParent, CompositeChild = cls.classes(
+            "CompositeParent", "CompositeChild"
+        )
+
+        session = Session(connection)
+        tags = [Tag(id=1, name="a"), Tag(id=2, name="b")]
+        session.add_all(tags)
+
+        # 4 parents, each with 6 children; rank repeats so the child
+        # primary key tiebreaker is exercised; every third child is
+        # inactive so that loader criteria can be tested.
+        session.add_all(
+            [
+                Parent(
+                    id=pid,
+                    children=[
+                        Child(
+                            id=pid * 100 + cid,
+                            rank=cid // 2,
+                            active=(cid % 3 != 0),
+                            tag=tags[cid % 2],
+                        )
+                        for cid in range(1, 7)
+                    ],
+                )
+                for pid in range(1, 5)
+            ]
+        )
+        # parent with no children, used for the empty-collection test
+        session.add(Parent(id=5))
+
+        session.add_all(
+            [
+                CompositeParent(
+                    k1=1,
+                    k2=1,
+                    kids=[
+                        CompositeChild(id=i, f1=1, f2=1)
+                        for i in range(1, 5)
+                    ],
+                ),
+                CompositeParent(
+                    k1=1,
+                    k2=2,
+                    kids=[
+                        CompositeChild(id=i, f1=1, f2=2)
+                        for i in range(10, 15)
+                    ],
+                ),
+            ]
+        )
+        session.commit()
+
+    def _load_parents(self, session, **kw):
+        Parent = self.classes.Parent
+        return session.scalars(
+            select(Parent)
+            .where(Parent.id < 5)
+            .options(selectinload(Parent.children, **kw))
+            .order_by(Parent.id)
+        ).all()
+
+    @testing.requires.window_functions
+    def test_basic_per_parent_limit(self):
+        session = fixture_session()
+
+        def go():
+            parents = self._load_parents(session, per_parent_limit=3)
+            eq_(
+                [(p.id, [c.id for c in p.children]) for p in parents],
+                [
+                    (1, [101, 102, 103]),
+                    (2, [201, 202, 203]),
+                    (3, [301, 302, 303]),
+                    (4, [401, 402, 403]),
+                ],
+            )
+
+        # one SELECT for the parents plus one windowed SELECT
+        self.assert_sql_count(testing.db, go, 2)
+
+    @testing.requires.window_functions
+    def test_tie_breaker_is_stable_by_child_pk(self):
+        session = fixture_session()
+
+        # ranks are 0,0,1,1,2,2 for ids 1..6; the first two ranks (four
+        # rows) come back ordered by rank then child primary key
+        parents = self._load_parents(session, per_parent_limit=4)
+        expected = [
+            [pid * 100 + cid for cid in range(1, 5)]
+            for pid in range(1, 5)
+        ]
+        eq_([[c.id for c in p.children] for p in parents], expected)
+
+        # loading one parent at a time produces identical ordering
+        parents_again = self._load_parents(
+            session, per_parent_limit=4, chunksize=1
+        )
+        eq_(
+            [[c.id for c in p.children] for p in parents_again], expected
+        )
+
+    @testing.requires.window_functions
+    def test_limit_larger_than_collection(self):
+        session = fixture_session()
+        parents = self._load_parents(session, per_parent_limit=100)
+        eq_([len(p.children) for p in parents], [6, 6, 6, 6])
+
+    def test_limit_zero_populates_empty_without_loader_sql(self):
+        session = fixture_session()
+
+        def go():
+            parents = self._load_parents(session, per_parent_limit=0)
+            eq_([list(p.children) for p in parents], [[], [], [], []])
+
+        # only the parent SELECT is emitted; no windowed loader SELECT
+        self.assert_sql_count(testing.db, go, 1)
+
+        parents = self._load_parents(session, per_parent_limit=0)
+
+        def access():
+            for parent in parents:
+                eq_(list(parent.children), [])
+
+        # the empty collections are marked loaded and emit no SQL
+        self.assert_sql_count(testing.db, access, 0)
+
+    @testing.requires.window_functions
+    def test_parent_with_empty_collection(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+        parent = session.scalars(
+            select(Parent)
+            .where(Parent.id == 5)
+            .options(selectinload(Parent.children, per_parent_limit=2))
+        ).one()
+        eq_(list(parent.children), [])
+
+    @testing.combinations(-1, "x", 1.5, True)
+    def test_invalid_per_parent_limit(self, value):
+        Parent = self.classes.Parent
+        session = fixture_session()
+        assert_raises_message(
+            sa.exc.ArgumentError,
+            "per_parent_limit.*positive non-zero integer, or zero",
+            lambda: session.scalars(
+                select(Parent).options(
+                    selectinload(Parent.children, per_parent_limit=value)
+                )
+            ).all(),
+        )
+
+    def test_many_to_one_is_rejected(self):
+        Child = self.classes.Child
+        session = fixture_session()
+        assert_raises_message(
+            sa.exc.InvalidRequestError,
+            "per_parent_limit option may only be applied to a "
+            "collection relationship",
+            lambda: session.scalars(
+                select(Child).options(
+                    selectinload(Child.parent, per_parent_limit=2)
+                )
+            ).all(),
+        )
+
+    @testing.requires.window_functions
+    def test_nested_eager_load(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+
+        def go():
+            parents = session.scalars(
+                select(Parent)
+                .where(Parent.id < 5)
+                .options(
+                    selectinload(
+                        Parent.children, per_parent_limit=2
+                    ).selectinload(self.classes.Child.tag)
+                )
+                .order_by(Parent.id)
+            ).all()
+            for parent in parents:
+                for child in parent.children:
+                    is_true("tag" in child.__dict__)
+            eq_(
+                [[c.id for c in p.children] for p in parents],
+                [
+                    [101, 102],
+                    [201, 202],
+                    [301, 302],
+                    [401, 402],
+                ],
+            )
+
+        # parents + limited children + tags
+        self.assert_sql_count(testing.db, go, 3)
+
+    @testing.requires.window_functions
+    def test_loader_criteria_applied_to_ranking(self):
+        Parent, Child = self.classes("Parent", "Child")
+        session = fixture_session()
+
+        parents = session.scalars(
+            select(Parent)
+            .where(Parent.id < 5)
+            .options(
+                selectinload(Parent.children, per_parent_limit=3),
+                # inactive children may not occupy a per-parent slot
+                with_loader_criteria(
+                    Child, Child.active == True  # noqa: E712
+                ),
+            )
+            .order_by(Parent.id)
+        ).all()
+        eq_(
+            [[c.id for c in p.children] for p in parents],
+            [
+                [101, 102, 104],
+                [201, 202, 204],
+                [301, 302, 304],
+                [401, 402, 404],
+            ],
+        )
+
+    @testing.requires.window_functions
+    def test_composite_parent_primary_key(self):
+        CompositeParent = self.classes.CompositeParent
+        session = fixture_session()
+        parents = session.scalars(
+            select(CompositeParent)
+            .options(
+                selectinload(CompositeParent.kids, per_parent_limit=2)
+            )
+            .order_by(CompositeParent.k1, CompositeParent.k2)
+        ).all()
+        eq_(
+            [((p.k1, p.k2), [c.id for c in p.kids]) for p in parents],
+            [((1, 1), [1, 2]), ((1, 2), [10, 11])],
+        )
+
+    @testing.requires.window_functions
+    def test_identity_map_uniqueness(self):
+        Parent, Child = self.classes("Parent", "Child")
+        session = fixture_session()
+        parents = session.scalars(
+            select(Parent).options(
+                selectinload(Parent.children, per_parent_limit=2)
+            )
+        ).all()
+        direct = session.get(Child, 101)
+        is_(parents[0].children[0], direct)
+
+    @testing.requires.window_functions
+    def test_partial_collection_not_marked_modified(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+        parent = session.scalars(
+            select(Parent)
+            .where(Parent.id == 1)
+            .options(selectinload(Parent.children, per_parent_limit=2))
+        ).one()
+        eq_([c.id for c in parent.children], [101, 102])
+        is_true(not session.is_modified(parent, include_collections=True))
+
+    @testing.requires.window_functions
+    def test_flush_does_not_delete_unloaded_children(self):
+        Parent, Child = self.classes("Parent", "Child")
+        session = fixture_session()
+        parent = session.scalars(
+            select(Parent)
+            .where(Parent.id == 1)
+            .options(selectinload(Parent.children, per_parent_limit=2))
+        ).one()
+        eq_([c.id for c in parent.children], [101, 102])
+
+        session.flush()
+
+        remaining = session.scalars(
+            select(Child.id).where(Child.parent_id == 1)
+        ).all()
+        eq_(remaining, [101, 102, 103, 104, 105, 106])
+
+    @testing.requires.window_functions
+    def test_existing_loaded_collection_left_in_place(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+        parent = session.get(Parent, 1)
+        full_ids = [c.id for c in parent.children]
+
+        result = session.scalars(
+            select(Parent)
+            .where(Parent.id == 1)
+            .options(selectinload(Parent.children, per_parent_limit=2))
+        ).one()
+        is_(result, parent)
+        eq_([c.id for c in result.children], full_ids)
+
+    @testing.requires.window_functions
+    def test_populate_existing_replaces_loaded_collection(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+        parent = session.get(Parent, 1)
+        eq_(
+            [c.id for c in parent.children],
+            [101, 102, 103, 104, 105, 106],
+        )
+
+        session.execute(
+            select(Parent)
+            .where(Parent.id == 1)
+            .options(selectinload(Parent.children, per_parent_limit=2))
+            .execution_options(populate_existing=True)
+        ).all()
+        eq_([c.id for c in parent.children], [101, 102])
+
+    @testing.requires.window_functions
+    def test_chunksize_chunks_windowed_statements(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+
+        def go():
+            session.scalars(
+                select(Parent)
+                .where(Parent.id < 5)
+                .options(
+                    selectinload(
+                        Parent.children,
+                        per_parent_limit=2,
+                        chunksize=2,
+                    )
+                )
+                .order_by(Parent.id)
+            ).all()
+
+        # one parent SELECT plus two windowed SELECTs for four parents
+        self.assert_sql_count(testing.db, go, 3)
+
+class PerParentLimitOrderingTest(fixtures.DeclarativeMappedTest):
+    __backend__ = True
+    run_inserts = "once"
+    run_deletes = None
+
+    @classmethod
+    def setup_classes(cls):
+        Base = cls.DeclarativeBasic
+
+        class Parent(ComparableEntity, Base):
+            __tablename__ = "pplo_parent"
+            id = Column(Integer, primary_key=True)
+            children = relationship(
+                "Child",
+                order_by=lambda: (Child.rank.desc(), Child.id.asc()),
+                back_populates="parent",
+            )
+
+        class Child(ComparableEntity, Base):
+            __tablename__ = "pplo_child"
+            id = Column(Integer, primary_key=True)
+            parent_id = Column(ForeignKey("pplo_parent.id"))
+            rank = Column(Integer)
+            parent = relationship("Parent", back_populates="children")
+
+    @classmethod
+    def insert_data(cls, connection):
+        Parent, Child = cls.classes("Parent", "Child")
+        session = Session(connection)
+        # rank pattern for ids 1..6: 0,0,1,1,2,2 (integer division by
+        # two of the id, not the zero-based position)
+        session.add(
+            Parent(
+                id=1,
+                children=[
+                    Child(id=cid, rank=(cid - 1) // 2)
+                    for cid in range(1, 7)
+                ],
+            )
+        )
+        session.commit()
+
+    @testing.requires.window_functions
+    def test_asc_desc_order_elements(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+        parent = session.scalars(
+            select(Parent)
+            .where(Parent.id == 1)
+            .options(selectinload(Parent.children, per_parent_limit=3))
+        ).one()
+        # descending rank selects the rank-2 rows first (ids 5, 6, child
+        # id ascending gives 5 then 6); the third slot is the first
+        # rank-1 row (id 3)
+        eq_([c.id for c in parent.children], [5, 6, 3])
+
+
+class PerParentLimitM2MTest(fixtures.DeclarativeMappedTest):
+    __backend__ = True
+    run_inserts = "once"
+    run_deletes = None
+
+    @classmethod
+    def setup_classes(cls):
+        Base = cls.DeclarativeBasic
+
+        secondary = Table(
+            "pplm_assoc",
+            Base.metadata,
+            Column("parent_id", ForeignKey("pplm_parent.id"),
+                   primary_key=True),
+            Column("keyword_id", ForeignKey("pplm_keyword.id"),
+                   primary_key=True),
+        )
+
+        # secondary without a unique constraint / primary key, allowing
+        # duplicated association rows to exercise fan-out deduplication
+        fanout_secondary = Table(
+            "pplm_fanout_assoc",
+            Base.metadata,
+            Column("parent_id", ForeignKey("pplm_fanout_parent.id")),
+            Column("keyword_id", ForeignKey("pplm_fanout_keyword.id")),
+        )
+
+        class Parent(ComparableEntity, Base):
+            __tablename__ = "pplm_parent"
+            id = Column(Integer, primary_key=True)
+            keywords = relationship(
+                "Keyword",
+                secondary=secondary,
+                order_by="Keyword.id",
+                back_populates="parents",
+            )
+
+        class Keyword(ComparableEntity, Base):
+            __tablename__ = "pplm_keyword"
+            id = Column(Integer, primary_key=True)
+            parents = relationship(
+                "Parent", secondary=secondary, back_populates="keywords"
+            )
+
+        class FanoutParent(ComparableEntity, Base):
+            __tablename__ = "pplm_fanout_parent"
+            id = Column(Integer, primary_key=True)
+            keywords = relationship(
+                "FanoutKeyword",
+                secondary=fanout_secondary,
+                order_by="FanoutKeyword.id",
+                viewonly=True,
+            )
+
+        class FanoutKeyword(ComparableEntity, Base):
+            __tablename__ = "pplm_fanout_keyword"
+            id = Column(Integer, primary_key=True)
+
+    @classmethod
+    def insert_data(cls, connection):
+        Parent, Keyword = cls.classes("Parent", "Keyword")
+        FanoutParent, FanoutKeyword = cls.classes(
+            "FanoutParent", "FanoutKeyword"
+        )
+        session = Session(connection)
+
+        keywords = [Keyword(id=i) for i in range(1, 9)]
+        session.add_all(keywords)
+        # p1 -> k1..k6; p2 -> k3..k8 (k3..k6 shared)
+        session.add(
+            Parent(id=1, keywords=keywords[0:6])
+        )
+        session.add(
+            Parent(id=2, keywords=keywords[2:8])
+        )
+
+        session.add_all([FanoutKeyword(id=i) for i in range(1, 6)])
+        session.add(FanoutParent(id=1))
+        session.commit()
+
+        # duplicate every association row to create join fan-out
+        fanout = FanoutParent.keywords.property.secondary
+        for kid in range(1, 6):
+            for _ in range(2):
+                connection.execute(
+                    fanout.insert().values(parent_id=1, keyword_id=kid)
+                )
+
+    @testing.requires.window_functions
+    def test_many_to_many_per_parent_limit(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+
+        def go():
+            parents = session.scalars(
+                select(Parent)
+                .options(selectinload(Parent.keywords, per_parent_limit=3))
+                .order_by(Parent.id)
+            ).all()
+            eq_(
+                [(p.id, [k.id for k in p.keywords]) for p in parents],
+                [(1, [1, 2, 3]), (2, [3, 4, 5])],
+            )
+
+        # one parent SELECT plus one windowed SELECT
+        self.assert_sql_count(testing.db, go, 2)
+
+    @testing.requires.window_functions
+    def test_m2m_identity_map_shared_child_unique(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+        parents = session.scalars(
+            select(Parent)
+            .options(selectinload(Parent.keywords, per_parent_limit=6))
+            .order_by(Parent.id)
+        ).all()
+        # the shared keyword k3 must be one ORM instance in both
+        # collections
+        p1, p2 = parents
+        shared = [k for k in p1.keywords if k.id == 3][0]
+        is_([k for k in p2.keywords if k.id == 3][0], shared)
+
+    @testing.requires.window_functions
+    def test_m2m_flush_does_not_delete_unloaded_associations(self):
+        Parent = self.classes.Parent
+        session = fixture_session()
+        parent = session.scalars(
+            select(Parent)
+            .where(Parent.id == 1)
+            .options(selectinload(Parent.keywords, per_parent_limit=3))
+        ).one()
+        eq_([k.id for k in parent.keywords], [1, 2, 3])
+        is_true(not session.is_modified(parent, include_collections=True))
+
+        session.flush()
+
+        Parent = self.classes.Parent
+        secondary = Parent.keywords.property.secondary
+        remaining = session.connection().execute(
+            select(secondary.c.keyword_id)
+            .where(secondary.c.parent_id == 1)
+            .order_by(secondary.c.keyword_id)
+        ).all()
+        eq_([row[0] for row in remaining], [1, 2, 3, 4, 5, 6])
+
+    @testing.requires.window_functions
+    def test_m2m_association_fanout_does_not_consume_slots(self):
+        FanoutParent = self.classes.FanoutParent
+        session = fixture_session()
+        parent = session.scalars(
+            select(FanoutParent)
+            .where(FanoutParent.id == 1)
+            .options(
+                selectinload(FanoutParent.keywords, per_parent_limit=3)
+            )
+        ).one()
+        # every association row is duplicated, but each ORM entity only
+        # occupies one slot
+        eq_([k.id for k in parent.keywords], [1, 2, 3])
+
+
+class PerParentLimitDialectTest(fixtures.TestBase):
+    def _dialect(self, name, supports, version_info):
+        dialect = mock.Mock(
+            supports_window_functions=supports,
+            server_version_info=version_info,
+        )
+        dialect.name = name
+        return dialect
+
+    def test_unsupported_dialect_raises(self):
+        from sqlalchemy.orm.strategies import _SelectInLoader
+
+        assert_raises_message(
+            sa.exc.InvalidRequestError,
+            "per_parent_limit option requires window functions.*does "
+            "not support",
+            _SelectInLoader._assert_per_parent_limit_supported,
+            self._dialect("sqlite", False, (3, 53, 1)),
+        )
+
+    @testing.combinations(
+        ("sqlite", (3, 24, 9)),
+        ("mysql", (5, 7, 0)),
+        ("mariadb", (10, 1, 9)),
+        argnames="name,version_info",
+    )
+    def test_too_old_backend_raises(self, name, version_info):
+        from sqlalchemy.orm.strategies import _SelectInLoader
+
+        assert_raises_message(
+            sa.exc.InvalidRequestError,
+            "per_parent_limit option requires window functions.*too "
+            "old",
+            _SelectInLoader._assert_per_parent_limit_supported,
+            self._dialect(name, True, version_info),
+        )
+
+    def test_supported_backend_passes(self):
+        from sqlalchemy.orm.strategies import _SelectInLoader
+
+        _SelectInLoader._assert_per_parent_limit_supported(
+            self._dialect("sqlite", True, (3, 25, 0))
+        )
+        _SelectInLoader._assert_per_parent_limit_supported(
+            self._dialect("postgresql", True, None)
+        )

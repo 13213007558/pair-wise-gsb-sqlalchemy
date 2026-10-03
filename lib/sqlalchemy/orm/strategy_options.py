@@ -363,6 +363,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         attr: _AttrType,
         recursion_depth: Optional[int] = None,
         chunksize: Optional[int] = None,
+        per_parent_limit: Optional[int] = None,
     ) -> Self:
         """Indicate that the given attribute should be loaded using
         SELECT IN eager loading.
@@ -407,6 +408,30 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
 
          .. versionadded:: 2.1.0b3
 
+        :param per_parent_limit: optional positive int; when set for a
+         collection-based relationship, the selectin loader will only load
+         this many related objects per parent object.  The related objects
+         are ordered using the relationship's
+         :paramref:`_orm.relationship.order_by` setting when present, with
+         the related object's primary key columns appended as a stable
+         tiebreaker so that results are deterministic when ordering values
+         are equal.  The per-parent limiting is implemented using the
+         ``ROW_NUMBER()`` window function and is therefore only supported on
+         database backends that provide window functions.
+
+         The collections loaded in this way are populated as a *partial*
+         collection; the collection is marked as fully loaded so that no
+         additional SQL is emitted upon access, yet unloaded members are not
+         deleted when the session is flushed.  If the collection was already
+         loaded, it is left in place unless
+         :paramref:`_orm.Session.populate_existing` is in effect, in which
+         case the already-loaded collection is replaced by the limited load.
+
+         ``0`` is accepted and populates every parent with an empty
+         collection without emitting the loader SELECT.
+
+         .. versionadded:: 2.1.0
+
         .. seealso::
 
             :ref:`loading_toplevel`
@@ -417,7 +442,11 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         return self._set_relationship_strategy(
             attr,
             {"lazy": "selectin"},
-            opts={"recursion_depth": recursion_depth, "chunksize": chunksize},
+            opts={
+                "recursion_depth": recursion_depth,
+                "chunksize": chunksize,
+                "per_parent_limit": per_parent_limit,
+            },
         )
 
     def lazyload(self, attr: _AttrType) -> Self:
@@ -2525,12 +2554,17 @@ def selectinload(
     *keys: _AttrType,
     recursion_depth: Optional[int] = None,
     chunksize: Optional[int] = None,
+    per_parent_limit: Optional[int] = None,
 ) -> _AbstractLoad:
     return _generate_from_keys(
         Load.selectinload,
         keys,
         False,
-        {"recursion_depth": recursion_depth, "chunksize": chunksize},
+        {
+            "recursion_depth": recursion_depth,
+            "chunksize": chunksize,
+            "per_parent_limit": per_parent_limit,
+        },
     )
 
 

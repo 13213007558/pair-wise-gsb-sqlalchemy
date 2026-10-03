@@ -844,6 +844,71 @@ Things to know about this kind of loading include:
   particular database does start supporting this syntax, it will work without
   any changes to SQLAlchemy (as was the case with SQLite).
 
+.. _selectin_per_parent_limit:
+
+Limiting the number of related objects per parent
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For listing pages that only display a few of the most relevant related objects
+for each parent (for example, the three most recent orders for each user), the
+:paramref:`_orm.selectinload.per_parent_limit` parameter of
+:func:`.selectinload` limits how many related objects are eagerly loaded for
+each parent without having to load the full collection into memory::
+
+    stmt = select(User).options(
+        selectinload(User.addresses, per_parent_limit=3)
+    )
+
+The parameter is supported for one-to-many and many-to-many *collection*
+relationships (it is not supported for many-to-one scalar references) and
+works with composite primary keys, :func:`.with_loader_criteria`, and
+nested eager loaders chained from the limited relationship::
+
+    stmt = select(User).options(
+        selectinload(User.orders, per_parent_limit=3)
+        .selectinload(Order.items)
+    )
+
+The per-parent limiting is implemented using the SQL ``ROW_NUMBER()`` window
+function; related objects are ranked using the relationship's
+:paramref:`_orm.relationship.order_by` setting, if present, and the related
+object's primary key columns are always appended to the ordering as a stable
+tiebreaker.  This guarantees deterministic results when ordering values are
+equal, including across independently emitted batches (see
+:paramref:`_orm.selectinload.chunksize`).  For many-to-many relationships the
+association rows are deduplicated before the ranking is applied, so repeated
+joins cannot cause the same related ORM object to consume more than one slot.
+
+The feature requires window function support in the underlying database; this
+includes SQLite 3.25 or higher, MySQL 8 / MariaDB 10.2 or higher, as well as
+PostgreSQL and most other modern backends.  Attempting to use
+``per_parent_limit`` against a dialect or backend version without window
+function support raises :class:`_exc.InvalidRequestError` when the loader runs.
+
+Collections populated this way are **partial** collections:
+
+* The collection is marked as fully loaded, so accessing it does not emit any
+  additional SQL, but it contains only the limited rows.
+* Populating the partial collection does not mark the attribute as modified;
+  flushing the session therefore does not delete the related rows and
+  association table rows that were not loaded.
+* If the collection was already fully (or partially) loaded on an object, the
+  existing collection is left untouched, consistent with the default eager
+  loading behavior.  Passing
+  the :ref:`populate_existing <orm_queryguide_populate_existing>`
+  execution option replaces the already-loaded collection with the
+  limited one.
+* ``per_parent_limit=0`` is accepted and populates each parent with an empty
+  collection without emitting the loader SELECT.
+* ORM instances continue to be deduplicated through the identity map, so a
+  related object shared by multiple parents (as in many-to-many) is still
+  represented by one instance.
+
+Because the partial collection is indistinguishable from a fully loaded one
+after loading, applications that need to later modify the complete collection
+should expire or refresh the attribute (for example with
+:meth:`_orm.Session.expire`) before doing so.
+
 
 .. _subquery_eager_loading:
 
