@@ -2117,6 +2117,7 @@ class OracleDialect(default._BackendsMultiReflection, default.DefaultDialect):
     supports_default_metavalue = True
     supports_empty_insert = False
     supports_identity_columns = True
+    supports_window_functions = True
 
     _supports_oracle_json = True
 

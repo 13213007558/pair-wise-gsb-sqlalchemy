@@ -3621,6 +3621,7 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
     supports_default_values = True
 
     supports_default_metavalue = True
+    supports_window_functions = True
 
     supports_empty_insert = False
     supports_multivalues_insert = True

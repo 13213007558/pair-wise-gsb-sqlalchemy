@@ -3191,6 +3191,7 @@ class MySQLDialect(_mariadb_shim.MariaDBShim, default.DefaultDialect):
         assert not self.is_mariadb
 
         self.supports_for_update_of = self.server_version_info >= (8,)
+        self.supports_window_functions = self.server_version_info >= (8,)
 
         self.use_mysql_for_share = self.server_version_info >= (8, 0, 1)
 

@@ -277,6 +277,10 @@ class MariaDBShim(DefaultDialect):
         assert self.is_mariadb
 
         self.supports_sequences = self.server_version_info >= (10, 3)
+        self.supports_window_functions = self.server_version_info >= (
+            10,
+            2,
+        )
 
         self.delete_returning = self.server_version_info >= (10, 0, 5)
 

@@ -3013,6 +3013,25 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
             )
         return user_input
 
+    @classmethod
+    def _set_limit(cls, loadopt) -> Optional[int]:
+        if loadopt is None or not hasattr(loadopt, "local_opts"):
+            return None
+
+        user_input = loadopt.local_opts.get("limit", None)
+        if user_input is None:
+            return None
+        elif (
+            not isinstance(user_input, int)
+            or isinstance(user_input, bool)
+            or user_input < 0
+        ):
+            raise sa_exc.ArgumentError(
+                f"'limit={user_input}' is not an appropriate input, "
+                "please use a non-negative integer."
+            )
+        return user_input
+
     def __init__(self, parent, strategy_key):
         super().__init__(parent, strategy_key)
         self.join_depth = self.parent_property.join_depth
@@ -3364,44 +3383,83 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 )
             ]
 
+        criteria_option = None
         if loadopt and loadopt._extra_criteria:
-            new_options += (
-                orm_util.LoaderCriteriaOption(
-                    effective_entity,
-                    loadopt._generate_extra_criteria(context),
-                ),
+            criteria_option = orm_util.LoaderCriteriaOption(
+                effective_entity,
+                loadopt._generate_extra_criteria(context),
             )
 
         if recursion_depth is not None:
             effective_path = effective_path._truncate_recursive()
 
-        q = q.options(*new_options)
+        chunksize = self._set_chunksize(loadopt)
+        limit = self._set_limit(loadopt)
 
-        q = q._update_compile_options({"_current_path": effective_path})
-        if context.populate_existing:
-            q = q.execution_options(populate_existing=True)
-
-        if self.parent_property.order_by:
-            if not query_info.load_with_join:
-                eager_order_by = self.parent_property.order_by
-                if effective_entity.is_aliased_class:
-                    eager_order_by = [
-                        effective_entity._adapt_element(elem)
-                        for elem in eager_order_by
-                    ]
-                q = q.order_by(*eager_order_by)
-            else:
-
-                def _setup_outermost_orderby(compile_context):
-                    compile_context.eager_order_by += tuple(
-                        util.to_list(self.parent_property.order_by)
+        if limit is not None:
+            if not self.uselist:
+                raise sa_exc.ArgumentError(
+                    "selectinload(..., limit=...) may only be used with "
+                    "collection relationships."
+                )
+            elif limit == 0:
+                for item in our_states:
+                    state, state_dict, overwrite = item[1:4]
+                    if not overwrite and self.key in state_dict:
+                        continue
+                    state.get_impl(self.key).set_committed_value(
+                        state, state_dict, ()
                     )
-
-                q = q._add_compile_state_func(
-                    _setup_outermost_orderby, self.parent_property
+                return
+            elif not context.session.get_bind(
+                mapper=self.mapper, clause=q
+            ).dialect.supports_window_functions:
+                raise sa_exc.CompileError(
+                    "selectinload(..., limit=...) requires a backend that "
+                    "supports window functions."
                 )
 
-        chunksize = self._set_chunksize(loadopt)
+            q = self._apply_limit(
+                q,
+                entity_sql,
+                effective_entity,
+                pk_cols,
+                new_options,
+                criteria_option,
+                effective_path,
+                limit,
+                context.populate_existing,
+            )
+        else:
+            if criteria_option is not None:
+                new_options += (criteria_option,)
+
+            q = q.options(*new_options)
+            q = q._update_compile_options(
+                {"_current_path": effective_path}
+            )
+            if context.populate_existing:
+                q = q.execution_options(populate_existing=True)
+
+            if self.parent_property.order_by:
+                if not query_info.load_with_join:
+                    eager_order_by = self.parent_property.order_by
+                    if effective_entity.is_aliased_class:
+                        eager_order_by = [
+                            effective_entity._adapt_element(elem)
+                            for elem in eager_order_by
+                        ]
+                    q = q.order_by(*eager_order_by)
+                else:
+
+                    def _setup_outermost_orderby(compile_context):
+                        compile_context.eager_order_by += tuple(
+                            util.to_list(self.parent_property.order_by)
+                        )
+
+                    q = q._add_compile_state_func(
+                        _setup_outermost_orderby, self.parent_property
+                    )
 
         if query_info.load_only_child:
             self._load_via_child(
@@ -3531,6 +3589,190 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                     state.get_impl(self.key).set_committed_value(
                         state, state_dict, collection
                     )
+
+    def _apply_limit(
+        self,
+        q,
+        entity_sql,
+        effective_entity,
+        pk_cols,
+        new_options,
+        criteria_option,
+        effective_path,
+        limit,
+        populate_existing,
+    ):
+        parent_pk_labels = [
+            col.label(f"_sa_selectin_parent_pk_{idx}")
+            for idx, col in enumerate(pk_cols)
+        ]
+
+        order_by = []
+        if self.parent_property.order_by:
+            order_by = util.to_list(self.parent_property.order_by)
+        order_by.extend(self.mapper.primary_key)
+        if effective_entity.is_aliased_class:
+            order_by = [
+                effective_entity._adapt_element(elem) for elem in order_by
+            ]
+        order_by = [
+            order_col
+            for raw_order_col in order_by
+            for order_col in sql_util.unwrap_order_by(raw_order_col)
+        ]
+        selected_order_by = [
+            order_col.label(f"_sa_selectin_order_{idx}")
+            for idx, order_col in enumerate(order_by)
+        ]
+        secondary_pk_labels = []
+        if self.parent_property.secondary is not None:
+            secondary_pk_labels = [
+                col.label(f"_sa_selectin_secondary_pk_{idx}")
+                for idx, col in enumerate(
+                    self.parent_property.secondary.primary_key
+                )
+            ]
+
+        where_criteria = q._where_criteria
+        if criteria_option is not None:
+            where_criteria += (criteria_option.where_criteria,)
+
+        inner = Select._create_raw_select(
+            _raw_columns=[
+                entity_sql,
+                *parent_pk_labels,
+                *selected_order_by,
+                *secondary_pk_labels,
+            ],
+            _from_obj=q.get_final_froms(),
+            _where_criteria=where_criteria,
+            _compile_options=_ORMCompileState.default_compile_options,
+            _propagate_attrs={
+                "compile_state_plugin": "orm",
+                "plugin_subject": effective_entity,
+            },
+        )
+        inner = inner._update_compile_options(
+            {"_current_path": effective_path}
+        )
+        inner_subq = inner.subquery()
+
+        parent_pk_cols = [
+            inner_subq.c[f"_sa_selectin_parent_pk_{idx}"]
+            for idx in range(len(parent_pk_labels))
+        ]
+        inner_order_cols = [
+            inner_subq.c[f"_sa_selectin_order_{idx}"]
+            for idx in range(len(selected_order_by))
+        ]
+        secondary_pk_cols = [
+            inner_subq.c[f"_sa_selectin_secondary_pk_{idx}"]
+            for idx in range(len(secondary_pk_labels))
+        ]
+        child_pk_names = {col.name for col in self.mapper.primary_key}
+        child_cols = [
+            col
+            for col in inner_subq.c
+            if not col.name.startswith("_sa_selectin_parent_pk_")
+            and not col.name.startswith("_sa_selectin_order_")
+            and not col.name.startswith("_sa_selectin_secondary_pk_")
+        ]
+        child_pk_cols = [
+            col for col in child_cols if col.name in child_pk_names
+        ]
+
+        pair_row_number = sql.func.row_number().over(
+            partition_by=[*parent_pk_cols, *child_pk_cols],
+            order_by=[*inner_order_cols, *secondary_pk_cols],
+        ).label("_sa_selectin_pair_row_number")
+        pair_subq = Select._create_raw_select(
+            _raw_columns=[
+                *parent_pk_cols,
+                pair_row_number,
+                *inner_order_cols,
+                *secondary_pk_cols,
+                *child_cols,
+            ],
+            _compile_options=_ORMCompileState.default_compile_options,
+        ).subquery()
+
+        pair_order_cols = [
+            pair_subq.c[f"_sa_selectin_order_{idx}"]
+            for idx in range(len(selected_order_by))
+        ]
+        rank = sql.func.dense_rank().over(
+            partition_by=[
+                pair_subq.c[f"_sa_selectin_parent_pk_{idx}"]
+                for idx in range(len(parent_pk_cols))
+            ],
+            order_by=pair_order_cols,
+        ).label("_sa_selectin_rank")
+        rank_subq = Select._create_raw_select(
+            _raw_columns=[
+                pair_subq.c._sa_selectin_pair_row_number,
+                rank,
+                *pair_subq.c,
+            ],
+            _compile_options=_ORMCompileState.default_compile_options,
+        ).subquery()
+
+        outer_entity_pks = [
+            effective_entity._adapt_element(col)
+            if effective_entity.is_aliased_class
+            else col
+            for col in self.mapper.primary_key
+        ]
+        rank_entity_pks = [
+            rank_subq.c[col.name] for col in self.mapper.primary_key
+        ]
+        outer_from = rank_subq.join(
+            entity_sql,
+            sql.and_(
+                *(
+                    entity_pk == rank_pk
+                    for entity_pk, rank_pk in zip(
+                        outer_entity_pks, rank_entity_pks
+                    )
+                )
+            ),
+        )
+        outer = Select._create_raw_select(
+            _raw_columns=[
+                *[
+                    rank_subq.c[f"_sa_selectin_parent_pk_{idx}"]
+                    for idx in range(len(parent_pk_cols))
+                ],
+                entity_sql,
+            ],
+            _from_obj=[outer_from],
+            _compile_options=_ORMCompileState.default_compile_options,
+            _propagate_attrs={
+                "compile_state_plugin": "orm",
+                "plugin_subject": effective_entity,
+            },
+        ).where(
+            sql.and_(
+                rank_subq.c._sa_selectin_pair_row_number == 1,
+                rank_subq.c._sa_selectin_rank <= limit,
+            )
+        )
+        outer = outer.options(*new_options)
+        outer = outer._update_compile_options(
+            {"_current_path": effective_path}
+        )
+        if populate_existing:
+            outer = outer.execution_options(populate_existing=True)
+
+        outer_order_by = [
+            rank_subq.c[f"_sa_selectin_parent_pk_{idx}"]
+            for idx in range(len(parent_pk_cols))
+        ]
+        outer_order_by.append(rank_subq.c._sa_selectin_rank)
+        outer_order_by.extend(
+            rank_subq.c[f"_sa_selectin_order_{idx}"]
+            for idx in range(len(selected_order_by))
+        )
+        return outer.order_by(*outer_order_by)
 
 
 def _single_parent_validator(desc, prop):

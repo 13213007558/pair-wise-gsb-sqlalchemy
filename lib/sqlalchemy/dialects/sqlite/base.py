@@ -2302,6 +2302,9 @@ class SQLiteDialect(default.DefaultDialect):
                 self.dbapi.sqlite_version_info
                 >= (3, 7, 11)
             )
+            self.supports_window_functions = (
+                self.dbapi.sqlite_version_info >= (3, 25, 0)
+            )
             # see https://www.sqlalchemy.org/trac/ticket/2568
             # as well as https://www.sqlite.org/src/info/600482d161
             self._broken_fk_pragma_quotes = self.dbapi.sqlite_version_info < (

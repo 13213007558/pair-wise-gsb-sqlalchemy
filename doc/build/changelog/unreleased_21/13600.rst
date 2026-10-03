@@ -1,0 +1,12 @@
+.. change::
+    :tags: feature, orm
+
+    Added :paramref:`_orm.selectinload.limit`, allowing
+    :func:`_orm.selectinload` to eagerly load a limited number of objects for
+    each parent collection.  The loader supports one-to-many and many-to-many
+    relationships, composite primary keys, additional loader criteria, nested
+    eager loaders, and deterministic tie-breaking using related object
+    primary keys.  Partial collections are not marked as user-modified, and
+    existing collections are replaced only when ``populate_existing()`` is
+    used.  The feature requires window function support in the target
+    database.

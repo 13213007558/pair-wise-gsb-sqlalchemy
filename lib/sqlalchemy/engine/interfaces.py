@@ -1369,6 +1369,9 @@ class Dialect(EventTarget):
     """target database supports ORDER BY <labelname>, where <labelname>
     refers to a label in the columns clause of the SELECT"""
 
+    supports_window_functions: bool
+    """target database supports window functions"""
+
     div_is_floordiv: bool
     """target database treats the / division operator as "floor division" """
 

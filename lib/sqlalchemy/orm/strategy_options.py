@@ -363,6 +363,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         attr: _AttrType,
         recursion_depth: Optional[int] = None,
         chunksize: Optional[int] = None,
+        limit: Optional[int] = None,
     ) -> Self:
         """Indicate that the given attribute should be loaded using
         SELECT IN eager loading.
@@ -407,6 +408,16 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
 
          .. versionadded:: 2.1.0b3
 
+        :param limit: optional int; when set to zero or a positive
+         integer, load at most that many related objects for each parent.
+         The relationship's ``order_by`` is used to determine which rows are
+         selected, with the related object's primary key added as a final
+         tie-breaker.  A value of zero loads empty collections without
+         querying for related rows.  This form requires the database to
+         support window functions.
+
+         .. versionadded:: 2.1
+
         .. seealso::
 
             :ref:`loading_toplevel`
@@ -414,10 +425,21 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
             :ref:`selectin_eager_loading`
 
         """
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or limit < 0
+        ):
+            raise sa_exc.ArgumentError(
+                f"'limit={limit}' is not an appropriate input, please use "
+                "a non-negative integer."
+            )
         return self._set_relationship_strategy(
             attr,
             {"lazy": "selectin"},
-            opts={"recursion_depth": recursion_depth, "chunksize": chunksize},
+            opts={
+                "recursion_depth": recursion_depth,
+                "chunksize": chunksize,
+                "limit": limit,
+            },
         )
 
     def lazyload(self, attr: _AttrType) -> Self:
@@ -2525,12 +2547,17 @@ def selectinload(
     *keys: _AttrType,
     recursion_depth: Optional[int] = None,
     chunksize: Optional[int] = None,
+    limit: Optional[int] = None,
 ) -> _AbstractLoad:
     return _generate_from_keys(
         Load.selectinload,
         keys,
         False,
-        {"recursion_depth": recursion_depth, "chunksize": chunksize},
+        {
+            "recursion_depth": recursion_depth,
+            "chunksize": chunksize,
+            "limit": limit,
+        },
     )
 
 

@@ -4742,3 +4742,340 @@ class SelectinM2ONoRelatedRowTest(fixtures.DeclarativeMappedTest):
 
             # NULL a_id
             is_(bs[2].a, None)
+
+
+class SelectinLimitTest(fixtures.DeclarativeMappedTest):
+    @classmethod
+    def setup_classes(cls):
+        Base = cls.DeclarativeBasic
+
+        child_table = Table(
+            "composite_child",
+            Base.metadata,
+            Column("id", Integer, primary_key=True),
+            Column("parent_id1", Integer),
+            Column("parent_id2", Integer),
+            Column("position", Integer, nullable=False),
+            ForeignKeyConstraint(
+                ["parent_id1", "parent_id2"],
+                ["composite_parent.id1", "composite_parent.id2"],
+            ),
+        )
+        association_table = Table(
+            "limit_association",
+            Base.metadata,
+            Column(
+                "parent_id", ForeignKey("limit_parent.id"), primary_key=True
+            ),
+            Column("association_id", Integer, primary_key=True),
+            Column(
+                "child_id", ForeignKey("limit_child.id"), primary_key=True
+            ),
+        )
+
+        class CompositeParent(ComparableEntity, Base):
+            __tablename__ = "composite_parent"
+            id1 = Column(Integer, primary_key=True)
+            id2 = Column(Integer, primary_key=True)
+            children = relationship(
+                "CompositeChild",
+                order_by=[child_table.c.position, child_table.c.id],
+            )
+
+        class CompositeChild(ComparableEntity, Base):
+            __table__ = child_table
+            toys = relationship("CompositeToy", order_by="CompositeToy.id")
+
+        class CompositeToy(ComparableEntity, Base):
+            __tablename__ = "composite_toy"
+            id = Column(Integer, primary_key=True)
+            child_id = Column(
+                ForeignKey("composite_child.id"), nullable=False
+            )
+
+        class LimitChild(ComparableEntity, Base):
+            __tablename__ = "limit_child"
+            id = Column(Integer, primary_key=True)
+            position = Column(Integer, nullable=False)
+            included = Column(Boolean, nullable=False, default=True)
+
+        class LimitParent(ComparableEntity, Base):
+            __tablename__ = "limit_parent"
+            id = Column(Integer, primary_key=True)
+            children = relationship(
+                LimitChild,
+                secondary=association_table,
+                order_by=[LimitChild.position, LimitChild.id],
+            )
+            unordered_children = relationship(
+                LimitChild, secondary=association_table, viewonly=True
+            )
+
+    @classmethod
+    def insert_data(cls, connection):
+        (
+            CompositeParent,
+            CompositeChild,
+            CompositeToy,
+            LimitParent,
+            LimitChild,
+        ) = cls.classes(
+            "CompositeParent",
+            "CompositeChild",
+            "CompositeToy",
+            "LimitParent",
+            "LimitChild",
+        )
+
+        session = Session(connection)
+        session.add_all(
+            [
+                CompositeParent(
+                    id1=1,
+                    id2=10,
+                    children=[
+                        CompositeChild(id=1, position=1),
+                        CompositeChild(
+                            id=2,
+                            position=1,
+                            toys=[CompositeToy(id=1)],
+                        ),
+                        CompositeChild(id=3, position=2),
+                    ],
+                ),
+                CompositeParent(id1=2, id2=20),
+                CompositeParent(
+                    id1=3,
+                    id2=30,
+                    children=[CompositeChild(id=4, position=1)],
+                ),
+            ]
+        )
+
+        children = [
+            LimitChild(id=1, position=1),
+            LimitChild(id=2, position=1),
+            LimitChild(id=3, position=2),
+            LimitChild(id=4, position=1, included=False),
+        ]
+        session.add_all([LimitParent(id=1), LimitParent(id=2), *children])
+        session.flush()
+        association_table = LimitChild.metadata.tables["limit_association"]
+        session.execute(
+            association_table.insert(),
+            [
+                {"parent_id": 1, "association_id": 1, "child_id": 1},
+                {"parent_id": 1, "association_id": 2, "child_id": 1},
+                {"parent_id": 1, "association_id": 1, "child_id": 2},
+                {"parent_id": 1, "association_id": 1, "child_id": 3},
+                {"parent_id": 2, "association_id": 1, "child_id": 4},
+            ],
+        )
+        session.commit()
+
+    def test_one_to_many_composite_key_ties_empty_and_nested(self):
+        CompositeParent, CompositeChild, CompositeToy = self.classes(
+            "CompositeParent", "CompositeChild", "CompositeToy"
+        )
+        session = fixture_session()
+
+        def go():
+            return session.scalars(
+                select(CompositeParent)
+                .options(
+                    selectinload(CompositeParent.children, limit=2).selectinload(
+                        CompositeChild.toys
+                    )
+                )
+                .order_by(CompositeParent.id1)
+            ).all()
+
+        parents = self.assert_sql_count(testing.db, go, 3)
+        eq_(
+            [
+                CompositeParent(
+                    id1=1,
+                    id2=10,
+                    children=[
+                        CompositeChild(id=1, position=1),
+                        CompositeChild(
+                            id=2,
+                            position=1,
+                            toys=[CompositeToy(id=1)],
+                        ),
+                    ],
+                ),
+                CompositeParent(id1=2, id2=20, children=[]),
+                CompositeParent(
+                    id1=3,
+                    id2=30,
+                    children=[CompositeChild(id=4, position=1)],
+                ),
+            ],
+            parents,
+        )
+        is_true(
+            not sa.inspect(parents[0]).attrs.children.history.has_changes()
+        )
+
+    def test_many_to_many_dedupes_secondary_rows_and_applies_criteria(self):
+        LimitParent, LimitChild = self.classes(
+            "LimitParent", "LimitChild"
+        )
+        session = fixture_session()
+
+        parents = session.scalars(
+            select(LimitParent)
+            .options(
+                selectinload(
+                    LimitParent.children.and_(LimitChild.included.is_(True)),
+                    limit=1,
+                )
+            )
+            .order_by(LimitParent.id)
+        ).all()
+
+        eq_([child.id for child in parents[0].children], [1])
+        eq_(parents[1].children, [])
+        is_true(
+            not sa.inspect(parents[0]).attrs.children.history.has_changes()
+        )
+
+        association_table = LimitChild.metadata.tables["limit_association"]
+        eq_(
+            session.execute(select(association_table)).all(),
+            [
+                (1, 1, 1),
+                (1, 2, 1),
+                (1, 1, 2),
+                (1, 1, 3),
+                (2, 1, 4),
+            ],
+        )
+
+    def test_unordered_collection_uses_primary_key(self):
+        LimitParent = self.classes.LimitParent
+        session = fixture_session()
+
+        parent = session.scalars(
+            select(LimitParent)
+            .where(LimitParent.id == 1)
+            .options(
+                selectinload(LimitParent.unordered_children, limit=1)
+            )
+        ).one()
+        eq_([child.id for child in parent.unordered_children], [1])
+
+    def test_flush_does_not_delete_unloaded_rows(self):
+        LimitParent, LimitChild = self.classes(
+            "LimitParent", "LimitChild"
+        )
+        session = fixture_session()
+        first_parent = session.get(LimitParent, 1)
+        session.add(type(first_parent)(id=3))
+        session.flush()
+
+        association_table = LimitChild.metadata.tables["limit_association"]
+        eq_(
+            session.execute(
+                select(association_table.c.child_id)
+                .where(association_table.c.parent_id == 1)
+                .order_by(
+                    association_table.c.association_id,
+                    association_table.c.child_id,
+                )
+            ).all(),
+            [(1,), (2,), (3,), (1,)],
+        )
+
+    def test_limit_zero_loads_empty_without_related_sql(self):
+        CompositeParent = self.classes.CompositeParent
+        session = fixture_session()
+
+        def go():
+            return session.scalars(
+                select(CompositeParent).options(
+                    selectinload(CompositeParent.children, limit=0)
+                )
+            ).all()
+
+        parents = self.assert_sql_count(testing.db, go, 1)
+        eq_(parents[0].children, [])
+        is_true(
+            not sa.inspect(parents[0]).attrs.children.history.has_changes()
+        )
+
+    @testing.combinations(-1, 0.0, "2", True)
+    def test_invalid_limit(self, limit):
+        CompositeParent = self.classes.CompositeParent
+        assert_raises_message(
+            sa.exc.ArgumentError,
+            "please use a non-negative integer",
+            selectinload,
+            CompositeParent.children,
+            limit=limit,
+        )
+
+    def test_unsupported_dialect_raises(self):
+        CompositeParent = self.classes.CompositeParent
+        prop = sa.inspect(CompositeParent.children).prop
+        session = fixture_session()
+        statement = select(CompositeParent).options(
+            selectinload(CompositeParent.children, limit=1)
+        )
+        loader = prop._get_strategy((("lazy", "selectin"),))
+        state = sa.inspect(session.get(CompositeParent, (1, 10)))
+        bind = mock.Mock()
+        bind.dialect.supports_window_functions = False
+        loadopt = statement._with_options[0].context[0]
+        context = mock.Mock(
+            session=session,
+            compile_state=mock.Mock(select_statement=statement),
+            user_passed_query=statement,
+            populate_existing=False,
+        )
+        with mock.patch.object(session, "get_bind", return_value=bind):
+            assert_raises_message(
+                sa.exc.CompileError,
+                "requires a backend that supports window functions",
+                loader._load_for_path,
+                context,
+                sa.inspect(CompositeParent)._path_registry,
+                [(state, False)],
+                None,
+                sa.inspect(CompositeParent.children).entity,
+                loadopt,
+                None,
+                {},
+            )
+
+    def test_populate_existing_replaces_existing_collection(self):
+        CompositeParent = self.classes.CompositeParent
+        session = fixture_session()
+        parent = session.scalars(
+            select(CompositeParent).where(CompositeParent.id1 == 1)
+        ).one()
+        eq_([child.id for child in parent.children], [1, 2, 3])
+
+        parent = session.scalars(
+            select(CompositeParent)
+            .where(CompositeParent.id1 == 1)
+            .options(selectinload(CompositeParent.children, limit=1))
+            .execution_options(populate_existing=True)
+        ).one()
+        eq_([child.id for child in parent.children], [1])
+
+    def test_loaded_collection_is_not_replaced_without_populate_existing(self):
+        CompositeParent = self.classes.CompositeParent
+        session = fixture_session()
+        parent = session.scalars(
+            select(CompositeParent).where(CompositeParent.id1 == 1)
+        ).one()
+        eq_([child.id for child in parent.children], [1, 2, 3])
+
+        parent = session.scalars(
+            select(CompositeParent)
+            .where(CompositeParent.id1 == 1)
+            .options(selectinload(CompositeParent.children, limit=1))
+        ).one()
+        eq_([child.id for child in parent.children], [1, 2, 3])

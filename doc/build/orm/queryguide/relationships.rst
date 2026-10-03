@@ -825,6 +825,45 @@ value from the parent object is used:
 Select IN loading also supports many-to-many relationships, where it currently
 will JOIN across all three tables to match rows from one side to the other.
 
+Limiting Collections Loaded Per Parent Object
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For collection relationships, :func:`_orm.selectinload` supports the
+:paramref:`_orm.selectinload.limit` parameter, which loads only the given
+number of related objects for each parent in a batch.  The relationship's
+:paramref:`_orm.relationship.order_by` is used to determine ordering.  Related
+object primary key columns are appended as a final tie-breaker so that equal
+sort values produce repeatable results across batches.  Ties remain grouped;
+when the ``Nth`` and following objects have the same ordering value, all of
+those objects are included::
+
+    stmt = select(User).options(selectinload(User.addresses, limit=10))
+
+The limit is applied per parent, including for one-to-many and many-to-many
+relationships with composite parent primary keys.  For many-to-many
+relationships, duplicate rows contributed by the association table are removed
+before the limit is calculated, so an ORM object can only occupy one position
+in a particular parent collection.  Loader criteria supplied through
+:meth:`.PropComparator.and_` are applied before ranking, and nested eager load
+options continue to apply to the objects that remain.
+
+``limit=0`` initializes each collection as empty without emitting the related
+SELECT.  These partial collections are set as their committed values, so the
+unit of work will not treat them as user replacement operations and a
+``flush()`` will not delete association rows that were not loaded.
+
+The loader never replaces a collection that is already loaded unless
+:ref:`orm_queryguide_populate_existing` is enabled.  With
+``execution_options(populate_existing=True)``, the existing collection is
+replaced with the limited result.  Without it, the already-loaded collection
+is retained and the limited query result is not assigned to that parent.
+Objects continue to use the identity map, so the same related object remains
+unique within a :class:`.Session` even if it is reached from more than one
+parent.
+
+The limiting form is implemented with window functions and raises a
+:class:`.CompileError` when the target dialect does not support them.
+
 Things to know about this kind of loading include:
 
 * The strategy emits a SELECT for up to 500 parent primary key values at a

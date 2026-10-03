@@ -3143,6 +3143,7 @@ class MSDialect(default._BackendsMultiReflection, default.DefaultDialect):
 
     # may be changed at server inspection time for older SQL server versions
     supports_multivalues_insert = True
+    supports_window_functions = True
 
     use_insertmanyvalues = True
 

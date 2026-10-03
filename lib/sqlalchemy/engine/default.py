@@ -319,6 +319,7 @@ class DefaultDialect(Dialect):
     non_native_boolean_check_constraint = True
 
     supports_simple_order_by_label = True
+    supports_window_functions = False
 
     tuple_in_values = False
 
