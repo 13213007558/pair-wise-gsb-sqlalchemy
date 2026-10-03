@@ -63,6 +63,7 @@ from ..sql.selectable import Select
 if TYPE_CHECKING:
     from .mapper import Mapper
     from .relationships import RelationshipProperty
+    from .session import Session
     from ..sql.elements import ColumnElement
 
 
@@ -1037,6 +1038,28 @@ class _LazyLoader(
             for pk in self.mapper.primary_key
         ]
 
+    def _has_pending_orphan(self, session: Session, state: InstanceState) -> bool:
+        prop = self.parent_property
+
+        if (
+            not prop.uselist
+            or prop.secondary is not None
+            or not prop._cascade.delete_orphan
+        ):
+            return False
+
+        has_parent = prop._dependency_processor.hasparent
+
+        for child_state in session._dirty_states:
+            if child_state is state or not child_state.has_identity:
+                continue
+
+            child_mapper = child_state.manager.mapper
+            if child_mapper.isa(self.mapper) and not has_parent(child_state):
+                return True
+
+        return False
+
     @util.preload_module("sqlalchemy.orm.strategy_options")
     def _emit_lazyload(
         self,
@@ -1072,8 +1095,14 @@ class _LazyLoader(
 
         pending = not state.key
 
-        # don't autoflush on pending
-        if pending or passive & attributes.NO_AUTOFLUSH:
+        # Don't autoflush while lazily loading a collection that may
+        # receive a persistent child removed from another collection; the
+        # child is a temporary orphan until the append event completes.
+        if (
+            pending
+            or passive & attributes.NO_AUTOFLUSH
+            or self._has_pending_orphan(session, state)
+        ):
             stmt._execution_options = util.immutabledict({"autoflush": False})
 
         use_get = self.use_get

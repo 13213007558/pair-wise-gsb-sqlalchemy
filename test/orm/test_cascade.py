@@ -1,12 +1,21 @@
 import copy
+import os
+import tempfile
+import threading
 
+from sqlalchemy import create_engine
+from sqlalchemy import delete
+from sqlalchemy import event
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import ForeignKey
 from sqlalchemy import func
 from sqlalchemy import Integer
 from sqlalchemy import select
 from sqlalchemy import String
+from sqlalchemy import text
+from sqlalchemy import update
 from sqlalchemy import testing
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import attributes
 from sqlalchemy.orm import backref
 from sqlalchemy.orm import CascadeOptions
@@ -17,6 +26,7 @@ from sqlalchemy.orm import foreign
 from sqlalchemy.orm import object_mapper
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import registry
 from sqlalchemy.orm import util as orm_util
 from sqlalchemy.orm import with_parent
 from sqlalchemy.orm.attributes import instance_state
@@ -3556,6 +3566,443 @@ class DoubleParentM2OOrphanTest(fixtures.MappedTest):
         a1 = Address()
         session.add(a1)
         session.flush()
+
+
+class DeleteOrphanGraphTransitionTest(fixtures.TestBase):
+    __requires__ = ("sqlite",)
+
+    def _node_fixture(self, *, ondelete=None):
+        mapper_registry = registry()
+        Base = mapper_registry.generate_base()
+
+        class Node(Base):
+            __tablename__ = "node"
+
+            id = Column(Integer, primary_key=True)
+            parent_id = Column(
+                Integer,
+                ForeignKey(
+                    "node.id",
+                    ondelete=ondelete,
+                ),
+            )
+            parent = relationship(
+                "Node",
+                remote_side="Node.id",
+                back_populates="children",
+            )
+            children = relationship(
+                "Node",
+                back_populates="parent",
+                cascade="all, delete-orphan",
+                passive_deletes=ondelete == "CASCADE",
+            )
+
+        return mapper_registry, Node
+
+    def _engine(
+        self,
+        mapper_registry,
+        *,
+        url="sqlite://",
+        static_pool=True,
+        create_tables=True,
+        statements=None,
+    ):
+        engine = create_engine(
+            url,
+            connect_args={"timeout": 5},
+            poolclass=StaticPool if static_pool else None,
+        )
+
+        @event.listens_for(engine, "connect")
+        def enable_sqlite_foreign_keys(dbapi_connection, record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+        if statements is not None:
+
+            @event.listens_for(engine, "before_cursor_execute")
+            def before_cursor_execute(
+                conn,
+                cursor,
+                statement,
+                parameters,
+                context,
+                executemany,
+            ):
+                statements.append(statement)
+
+        if create_tables:
+            mapper_registry.metadata.create_all(engine)
+        return engine
+
+    def _setup_rows(self, session, Node):
+        parent_one = Node(id=1)
+        parent_two = Node(id=2)
+        child = Node(id=3)
+        parent_one.children.append(child)
+        session.add_all([parent_one, parent_two])
+        session.flush()
+        session.expunge_all()
+        return (
+            session.get(Node, 1),
+            session.get(Node, 2),
+            session.get(Node, 3),
+        )
+
+    def test_reparent_during_lazy_collection_init_no_delete(self):
+        mapper_registry, Node = self._node_fixture()
+        statements = []
+        engine = self._engine(
+            mapper_registry, statements=statements
+        )
+
+        with Session(engine) as session:
+            parent_one, parent_two, child = self._setup_rows(session, Node)
+            parent_one.children.remove(child)
+            parent_two.children.append(child)
+
+            assert not any(
+                statement.lstrip().startswith("DELETE")
+                for statement in statements
+            )
+            assert child in parent_two.children
+            assert child.parent is parent_two
+            eq_(
+                attributes.get_history(child, "parent").added,
+                [parent_two],
+            )
+            eq_(
+                attributes.get_history(
+                    parent_two, "children"
+                ).deleted,
+                [],
+            )
+
+            session.flush()
+
+            assert not any(
+                statement.lstrip().startswith("DELETE")
+                for statement in statements
+            )
+            assert statements[-1].lstrip().startswith("UPDATE")
+            eq_(
+                session.execute(text("SELECT id, parent_id FROM node")).all(),
+                [(1, None), (2, None), (3, 2)],
+            )
+            eq_(
+                (child in parent_one.children, child in parent_two.children),
+                (False, True),
+            )
+            eq_(
+                (
+                    attributes.get_history(child, "parent").added,
+                    attributes.get_history(child, "parent").unchanged,
+                    attributes.get_history(child, "parent").deleted,
+                ),
+                ((), [parent_two], ()),
+            )
+
+    def test_true_orphan_still_deletes_when_lazy_collection_loads(self):
+        mapper_registry, Node = self._node_fixture()
+        engine = self._engine(mapper_registry)
+
+        with Session(engine) as session:
+            parent, child = Node(id=1), Node(id=2)
+            parent.children.append(child)
+            session.add(parent)
+            session.flush()
+            session.expunge_all()
+
+            parent = session.get(Node, 1)
+            child = session.get(Node, 2)
+            parent.children.remove(child)
+
+            eq_(parent.children, [])
+            session.flush()
+            eq_(
+                session.execute(text("SELECT id FROM node")).all(),
+                [(1,)],
+            )
+            assert child not in session
+
+    @uses_deprecated(
+        "The `objects` parameter of `Session.flush` is deprecated"
+    )
+    def test_unflushed_and_partial_flush_remain_reparentable(self):
+        mapper_registry, Node = self._node_fixture()
+        engine = self._engine(mapper_registry)
+
+        with Session(engine) as session:
+            pending_child = Node(id=4)
+            parent_one = Node(id=1, children=[Node(id=2), pending_child])
+            parent_two = Node(id=3)
+            session.add_all([parent_one, parent_two])
+            session.flush()
+
+            existing_child = session.get(Node, 2)
+            parent_one.children.remove(existing_child)
+            parent_two.children.append(existing_child)
+            parent_one.children.remove(pending_child)
+            parent_two.children.append(pending_child)
+
+            session.flush([parent_two])
+
+            eq_(
+                session.execute(
+                    text("SELECT id, parent_id FROM node ORDER BY id")
+                ).all(),
+                [(1, None), (2, 3), (3, None), (4, 3)],
+            )
+            eq_(
+                [node.id for node in parent_one.children],
+                [],
+            )
+            eq_(
+                [node.id for node in parent_two.children],
+                [2, 4],
+            )
+
+    @testing.requires.compat_savepoints
+    def test_savepoint_rollback_restores_database_and_expired_graph(self):
+        mapper_registry, Node = self._node_fixture()
+        engine = self._engine(mapper_registry)
+
+        with Session(engine) as session:
+            parent_one, parent_two, child = self._setup_rows(session, Node)
+
+            savepoint = session.begin_nested()
+            parent_one.children.remove(child)
+            parent_two.children.append(child)
+            session.flush()
+            eq_(
+                session.execute(
+                    text("SELECT parent_id FROM node WHERE id = 3")
+                ).scalar(),
+                2,
+            )
+
+            savepoint.rollback()
+            eq_(
+                session.execute(
+                    text("SELECT parent_id FROM node WHERE id = 3")
+                ).scalar(),
+                1,
+            )
+            session.expire_all()
+
+            eq_([node.id for node in parent_one.children], [3])
+            eq_(parent_two.children, [])
+            assert child.parent is parent_one
+
+    def test_bulk_statement_leaves_identity_map_unchanged_until_expired(self):
+        mapper_registry, Node = self._node_fixture()
+        engine = self._engine(mapper_registry)
+
+        with Session(engine) as session:
+            parent_one, parent_two, child = self._setup_rows(session, Node)
+
+            result = session.execute(
+                update(Node).where(Node.id == 3).values(parent_id=2),
+                execution_options={"synchronize_session": False},
+            )
+            eq_(result.rowcount, 1)
+            eq_(child.parent_id, 1)
+            eq_(
+                session.execute(
+                    text("SELECT parent_id FROM node WHERE id = 3")
+                ).scalar(),
+                2,
+            )
+
+            session.expire_all()
+            eq_(child.parent_id, 2)
+            eq_([node.id for node in parent_one.children], [])
+            eq_([node.id for node in parent_two.children], [3])
+
+    def test_bulk_mappings_after_orphan_event_still_runs_orphan_delete(self):
+        mapper_registry, Node = self._node_fixture()
+        engine = self._engine(mapper_registry)
+
+        with Session(engine) as session:
+            parent, child = Node(id=1), Node(id=2)
+            parent.children.append(child)
+            session.add(parent)
+            session.flush()
+            session.expunge_all()
+
+            parent = session.get(Node, 1)
+            child = session.get(Node, 2)
+            parent.children.remove(child)
+            session.bulk_update_mappings(
+                Node, [{"id": 2, "parent_id": None}]
+            )
+            session.flush()
+
+            eq_(
+                session.execute(text("SELECT id FROM node ORDER BY id")).all(),
+                [(1,)],
+            )
+            assert child not in session
+
+    def test_merge_flushes_orphan_before_replacing_graph(self):
+        mapper_registry, Node = self._node_fixture()
+        statements = []
+        engine = self._engine(
+            mapper_registry, statements=statements
+        )
+
+        with Session(engine) as session:
+            parent_one, parent_two, child = self._setup_rows(session, Node)
+            statements.clear()
+            parent_one.children.remove(child)
+
+            incoming_parent = Node(id=2)
+            incoming_parent.children = [Node(id=3)]
+            merged_parent = session.merge(incoming_parent)
+
+            assert child not in session
+            eq_(
+                next(
+                    statement.lstrip()
+                    for statement in statements
+                    if statement.lstrip().startswith("DELETE")
+                ),
+                "DELETE FROM node WHERE node.id = ?",
+            )
+            eq_(
+                [node.id for node in merged_parent.children],
+                [3],
+            )
+            session.flush()
+            assert any(
+                statement.lstrip().startswith(
+                    "INSERT INTO node (id, parent_id)"
+                )
+                for statement in statements
+            )
+            eq_(
+                session.execute(
+                    text("SELECT id, parent_id FROM node WHERE id = 3")
+                ).all(),
+                [(3, 2)],
+            )
+
+    def test_database_cascade_with_passive_deletes(self):
+        mapper_registry, Node = self._node_fixture(ondelete="CASCADE")
+        statements = []
+        engine = self._engine(
+            mapper_registry, statements=statements
+        )
+
+        with Session(engine) as session:
+            parent, child = Node(id=1), Node(id=2)
+            parent.children.append(child)
+            session.add(parent)
+            session.flush()
+            session.expunge_all()
+
+            parent = session.get(Node, 1)
+            session.delete(parent)
+            session.flush()
+
+            delete_statements = [
+                statement
+                for statement in statements
+                if statement.lstrip().startswith("DELETE")
+            ]
+            eq_(len(delete_statements), 1)
+            assert statements[-1].lstrip().startswith("DELETE FROM node")
+            eq_(
+                session.execute(text("SELECT COUNT(*) FROM node")).scalar(),
+                0,
+            )
+
+    def test_concurrent_session_delete_raises_database_integrity_error(self):
+        mapper_registry, Node = self._node_fixture()
+        temporary_directory = (
+            "/private/tmp" if os.path.isdir("/private/tmp") else None
+        )
+        with tempfile.TemporaryDirectory(dir=temporary_directory) as directory:
+            path = os.path.join(directory, "concurrent.db")
+            url = f"sqlite:///{path}"
+            setup_engine = self._engine(
+                mapper_registry, url=url, static_pool=False
+            )
+            with Session(setup_engine) as session:
+                parent_one = Node(id=1)
+                parent_two = Node(id=2)
+                child = Node(id=3, parent_id=1)
+                session.add_all([parent_one, parent_two, child])
+                session.commit()
+            setup_engine.dispose()
+
+            first_engine = self._engine(
+                mapper_registry,
+                url=url,
+                static_pool=False,
+                create_tables=False,
+            )
+            second_engine = self._engine(
+                mapper_registry,
+                url=url,
+                static_pool=False,
+                create_tables=False,
+            )
+
+            reparented = threading.Event()
+            errors = []
+
+            def reparent_child():
+                try:
+                    with Session(first_engine) as session:
+                        parent_one = session.get(Node, 1)
+                        parent_two = session.get(Node, 2)
+                        child = session.get(Node, 3)
+                        parent_one.children.remove(child)
+                        parent_two.children.append(child)
+                        session.commit()
+                        reparented.set()
+                except Exception as error:
+                    errors.append(error)
+
+            def delete_new_parent():
+                reparented.wait(5)
+                try:
+                    with Session(second_engine) as session:
+                        session.connection().execute(
+                            delete(Node.__table__).where(Node.id == 2)
+                        )
+                except Exception as error:
+                    errors.append(error)
+
+            first_thread = threading.Thread(target=reparent_child)
+            second_thread = threading.Thread(target=delete_new_parent)
+            first_thread.start()
+            second_thread.start()
+            first_thread.join(10)
+            second_thread.join(10)
+
+            assert not first_thread.is_alive()
+            assert not second_thread.is_alive()
+            eq_(len(errors), 1)
+            assert_raises_message(
+                sa_exc.IntegrityError,
+                "FOREIGN KEY constraint failed",
+                lambda: (_ for _ in ()).throw(errors[0]),
+            )
+
+            with Session(first_engine) as session:
+                eq_(
+                    session.execute(
+                        text("SELECT id, parent_id FROM node ORDER BY id")
+                    ).all(),
+                    [(1, None), (2, None), (3, 2)],
+                )
+            first_engine.dispose()
+            second_engine.dispose()
 
 
 class CollectionAssignmentOrphanTest(fixtures.MappedTest):
