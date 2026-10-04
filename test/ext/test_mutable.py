@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import gc
 import pickle
+import weakref
 from typing import Any
 from typing import Dict
 
@@ -12,12 +14,17 @@ from sqlalchemy import func
 from sqlalchemy import inspect
 from sqlalchemy import Integer
 from sqlalchemy import JSON
+from sqlalchemy import create_engine
 from sqlalchemy import select
 from sqlalchemy import String
+from sqlalchemy import text
 from sqlalchemy import testing
 from sqlalchemy.ext.mutable import MutableComposite
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.ext.mutable import MutableList
+from sqlalchemy.ext.mutable import MutableJSON
+from sqlalchemy.ext.mutable import MutableJSONDict
+from sqlalchemy.ext.mutable import MutableJSONList
 from sqlalchemy.ext.mutable import MutableSet
 from sqlalchemy.orm import attributes
 from sqlalchemy.orm import column_property
@@ -276,6 +283,238 @@ class MiscTest(fixtures.TestBase):
         eq_(len(A.json.dispatch.set), 1)
         eq_(len(B.json.dispatch.set), 1)
         eq_(len(C.json.dispatch.set), 1)
+
+
+class MutableJSONSQLiteTest(fixtures.TestBase):
+    __requires__ = ("sqlite",)
+
+    def setup_test(self):
+        self.engine = create_engine("sqlite://")
+        self.Base = declarative_base()
+
+        class Thing(self.Base):
+            __tablename__ = "mutable_json_thing"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            data: Mapped[Any] = mapped_column(
+                MutableJSON.as_mutable(JSON), nullable=True
+            )
+            other: Mapped[Any] = mapped_column(
+                MutableJSON.as_mutable(JSON), nullable=True
+            )
+
+        self.Thing = Thing
+        self.Base.metadata.create_all(self.engine)
+
+    def teardown_test(self):
+        self.engine.dispose()
+
+    @staticmethod
+    def _stored_data(sess, value_id=1):
+        return sess.execute(
+            text(
+                "SELECT data FROM mutable_json_thing WHERE id = :id"
+            ),
+            {"id": value_id},
+        ).scalar_one()
+
+    def test_nested_mutation_persists(self):
+        with Session(self.engine) as sess:
+            thing = self.Thing(
+                data={
+                    "a": {"b": 1},
+                    "c": [1, {"d": 2}],
+                }
+            )
+            sess.add(thing)
+            sess.commit()
+
+            thing.data["a"]["b"] = 3
+            thing.data["c"][1]["d"] = 4
+            assert thing in sess.dirty
+            sess.commit()
+
+            eq_(
+                self._stored_data(sess),
+                '{"a": {"b": 3}, "c": [1, {"d": 4}]}',
+            )
+
+    def test_root_list_and_nested_reference(self):
+        with Session(self.engine) as sess:
+            shared = {"x": 1}
+            thing = self.Thing(data=[shared, shared])
+            sess.add(thing)
+            sess.flush()
+
+            thing.data[0]["x"] = 2
+            assert thing in sess.dirty
+            sess.commit()
+
+            stored = self._stored_data(sess)
+            eq_(stored, '[{"x": 2}, {"x": 2}]')
+
+    def test_replaced_path_detaches_old_reference(self):
+        with Session(self.engine) as sess:
+            thing = self.Thing(data={"a": {"x": 1}})
+            sess.add(thing)
+            sess.commit()
+
+            old = thing.data["a"]
+            thing.data["a"] = {"x": 2}
+            old["x"] = 3
+
+            assert thing in sess.dirty
+            sess.commit()
+
+            stored = self._stored_data(sess)
+            eq_(stored, '{"a": {"x": 2}}')
+            eq_(old, {"x": 3})
+
+    def test_repeated_reference_keeps_remaining_path(self):
+        with Session(self.engine, expire_on_commit=False) as sess:
+            shared = {"x": 1}
+            thing = self.Thing(data={"a": shared, "b": shared})
+            sess.add(thing)
+            sess.commit()
+
+            shared = thing.data["a"]
+            is_(thing.data["a"], thing.data["b"])
+            thing.data["a"] = None
+
+            shared["x"] = 2
+            assert thing in sess.dirty
+            sess.commit()
+
+            stored = self._stored_data(sess)
+            eq_(stored, '{"a": null, "b": {"x": 2}}')
+
+    def test_shared_child_notifies_multiple_entities(self):
+        with Session(self.engine) as sess:
+            shared = MutableJSONDict({"x": 1})
+            first = self.Thing(id=1, data={"child": shared})
+            second = self.Thing(id=2, data={"child": shared})
+            sess.add_all([first, second])
+            sess.flush()
+
+            shared["x"] = 2
+            assert first in sess.dirty
+            assert second in sess.dirty
+            sess.commit()
+
+            rows = sess.execute(
+                text("SELECT data FROM mutable_json_thing ORDER BY id")
+            ).all()
+            eq_(
+                [row[0] for row in rows],
+                ['{"child": {"x": 2}}', '{"child": {"x": 2}}'],
+            )
+
+    def test_shared_root_notifies_and_detaches_by_attribute(self):
+        with Session(self.engine, expire_on_commit=False) as sess:
+            shared = {"x": 1}
+            thing = self.Thing(data=shared, other=shared)
+            sess.add(thing)
+            sess.flush()
+
+            is_(thing.data, thing.other)
+            thing.data["x"] = 2
+            assert thing in sess.dirty
+
+            old = thing.other
+            thing.other = None
+            assert list(old._json_roots.values()) == [{"data"}]
+            assert dict(old._parents) == {
+                thing._sa_instance_state: "data"
+            }
+
+            thing.data = None
+            assert not old._json_roots
+            assert not old._parents
+
+    def test_rollback_restores_nested_state(self):
+        with Session(self.engine) as sess:
+            thing = self.Thing(data={"a": {"b": 1}})
+            sess.add(thing)
+            sess.commit()
+
+            thing.data["a"]["b"] = 2
+            assert thing in sess.dirty
+            sess.rollback()
+
+            assert thing not in sess.dirty
+            eq_(thing.data, {"a": {"b": 1}})
+            thing.data["a"]["b"] = 3
+            assert thing in sess.dirty
+
+    def test_refresh_detaches_old_graph(self):
+        with Session(self.engine) as sess:
+            thing = self.Thing(data={"a": {"b": 1}})
+            sess.add(thing)
+            sess.commit()
+
+            old_root = thing.data
+            old_nested = thing.data["a"]
+            sess.refresh(thing)
+
+            old_nested["b"] = 2
+            assert thing not in sess.dirty
+            eq_(thing.data, {"a": {"b": 1}})
+            assert old_root is not thing.data
+
+    def test_pickle_and_deepcopy_rebuild_nested_tracking(self):
+        value = MutableJSONDict({"a": {"b": 1}})
+        copied_value = copy.deepcopy(value)
+        assert isinstance(copied_value["a"], MutableJSONDict)
+        copied_value["a"]["b"] = 3
+        eq_(copied_value, {"a": {"b": 3}})
+
+        restored_value = pickle.loads(pickle.dumps(value))
+        assert isinstance(restored_value, MutableJSONDict)
+        assert isinstance(restored_value["a"], MutableJSONDict)
+        restored_value["a"]["b"] = 4
+        eq_(restored_value, {"a": {"b": 4}})
+
+    def test_cycle_is_rejected_without_mutation(self):
+        plain_cycle = []
+        plain_cycle.append(plain_cycle)
+
+        with Session(self.engine) as sess:
+            assert_raises_message(
+                ValueError,
+                "cyclic JSON",
+                self.Thing,
+                data=plain_cycle,
+            )
+
+            thing = self.Thing(data={})
+            sess.add(thing)
+            cyclic = MutableJSONList()
+            list.append(cyclic, cyclic)
+            assert_raises_message(
+                ValueError,
+                "cyclic",
+                thing.data.__setitem__,
+                "a",
+                cyclic,
+            )
+            eq_(thing.data, {})
+
+    def test_detached_graph_does_not_notify_after_entity_gc(self):
+        sess = Session(self.engine)
+        thing = self.Thing(data={"child": {"x": 1}})
+        sess.add(thing)
+        sess.commit()
+
+        child = thing.data["child"]
+        ref = weakref.ref(thing)
+        del thing
+        gc.collect()
+
+        assert ref() is None
+        assert not child._parents
+        child["x"] = 2
+        eq_(child, {"x": 2})
+        sess.close()
 
 
 class _MutableDictTestBase(_MutableDictTestFixture):

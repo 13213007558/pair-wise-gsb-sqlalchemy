@@ -731,6 +731,7 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
     def _expire(
         self, dict_: _InstanceDict, modified_set: Set[InstanceState[Any]]
     ) -> None:
+        self.manager.dispatch.before_expire(self, None)
         self.expired = True
         if self.modified:
             modified_set.discard(self)
@@ -784,6 +785,8 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
         attribute_names: Iterable[str],
         no_loader: bool = False,
     ) -> None:
+        attribute_names = list(attribute_names)
+        self.manager.dispatch.before_expire(self, attribute_names)
         pending = self.__dict__.get("_pending_mutations", None)
 
         callables = self.callables

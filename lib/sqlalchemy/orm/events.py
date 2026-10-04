@@ -584,6 +584,26 @@ class InstanceEvents(event.Events[ClassManager[Any]]):
 
         """
 
+    def before_expire(
+        self, target: _O, attrs: Optional[Iterable[str]]
+    ) -> None:
+        """Receive an object instance before its attributes or some subset
+        have been expired.
+
+        :param target: the mapped instance. If
+         the event is configured with ``raw=True``, this will instead be the
+         :class:`.InstanceState` state-management object associated with
+         the instance.
+
+        :param attrs: sequence of attribute names which will be expired, or
+         ``None`` if all attributes will be expired.
+
+        This event is dispatched while the current attribute values are still
+        available, allowing extensions to release state associated with the
+        outgoing values.
+
+        """
+
     def pickle(self, target: _O, state_dict: _InstanceDict) -> None:
         """Receive an object instance when its associated state is
         being pickled.

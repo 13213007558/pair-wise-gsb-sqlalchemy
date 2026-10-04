@@ -31,4 +31,14 @@ API Reference
     :members:
     :undoc-members:
 
+.. autoclass:: MutableJSON
+    :members: coerce
+
+.. autoclass:: MutableJSONDict
+    :members:
+    :undoc-members:
+
+.. autoclass:: MutableJSONList
+    :members:
+    :undoc-members:
 

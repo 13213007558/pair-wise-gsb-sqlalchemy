@@ -239,6 +239,40 @@ from within the mutable extension::
     def modified_json(instance, initiator):
         print("json value modified:", instance.data)
 
+Tracking Nested JSON Values
+---------------------------
+
+The :class:`.MutableDict` and :class:`.MutableList` types only coerce the
+top-level value.  For :class:`.JSON` columns whose root may be an object or
+array and whose nested objects and arrays also require change tracking, use
+:class:`.MutableJSON`::
+
+    from sqlalchemy import JSON
+    from sqlalchemy.ext.mutable import MutableJSON
+
+    class MyDataClass(Base):
+        __tablename__ = "my_data"
+
+        id: Mapped[int] = mapped_column(primary_key=True)
+        data: Mapped[dict | list] = mapped_column(
+            MutableJSON.as_mutable(JSON)
+        )
+
+Nested dictionaries and lists are converted to :class:`.MutableJSONDict`
+and :class:`.MutableJSONList` on assignment.  The same mutable container may
+be referenced from multiple positions or entities; a notification is sent to
+every still-associated ORM root.  Replacing or deleting a path decrements the
+reference count for that edge only, so other paths continue to notify their
+own roots.  Parent links are weak references and do not keep recycled entities
+alive.
+
+JSON structures must be acyclic.  Cycles are rejected during coercion before
+the target container is modified::
+
+    cyclic = []
+    cyclic.append(cyclic)
+    MyDataClass(data=cyclic)  # raises ValueError
+
 .. _mutable_composites:
 
 Establishing Mutability on Composites
@@ -379,11 +413,14 @@ pickling process of the parent's object-relational state so that the
 from __future__ import annotations
 
 from collections import defaultdict
+from collections import deque
+import copy
 from typing import AbstractSet
 from typing import Any
 from typing import Dict
 from typing import Iterable
 from typing import List
+from typing import NoReturn
 from typing import Optional
 from typing import overload
 from typing import Set
@@ -393,10 +430,10 @@ from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import Union
 import weakref
+from weakref import finalize
 from weakref import WeakKeyDictionary
 
 from .. import event
-from .. import inspect
 from .. import types
 from ..orm import Mapper
 from ..orm._typing import _ExternalEntityType
@@ -442,6 +479,12 @@ class MutableBase:
         """
 
         return weakref.WeakKeyDictionary()
+
+    def _attach_root(self, state: InstanceState[Any], key: str) -> None:
+        self._parents[state] = key
+
+    def _detach_root(self, state: InstanceState[Any], key: str) -> None:
+        self._parents.pop(state, None)
 
     @classmethod
     def coerce(cls, key: str, value: Any) -> Optional[Any]:
@@ -524,7 +567,15 @@ class MutableBase:
                     val = cls.coerce(key, val)
                     assert val is not None
                     state.dict[key] = val
-                val._parents[state] = key
+                val._attach_root(state, key)
+
+        def before_expire(
+            state: InstanceState[_O], attrs: Optional[Iterable[Any]]
+        ) -> None:
+            if attrs is None or listen_keys.intersection(attrs):
+                val = state.dict.get(key, None)
+                if isinstance(val, MutableBase):
+                    val._detach_root(state, key)
 
         def load_attrs(
             state: InstanceState[_O],
@@ -548,15 +599,15 @@ class MutableBase:
             outgoing.
 
             """
-            if value is oldvalue:
+            if value is oldvalue and value is not None:
                 return value
 
             if not isinstance(value, cls):
                 value = cls.coerce(key, value)
             if value is not None:
-                value._parents[target] = key
-            if isinstance(oldvalue, cls):
-                oldvalue._parents.pop(inspect(target), None)
+                value._attach_root(target, key)
+            if isinstance(oldvalue, MutableBase):
+                oldvalue._detach_root(target, key)
             return value
 
         def pickle(
@@ -576,10 +627,10 @@ class MutableBase:
                 if isinstance(collection, list):
                     # legacy format
                     for val in collection:
-                        val._parents[state] = key
+                        val._attach_root(state, key)
                 else:
                     for val in state_dict["ext.mutable.values"][key]:
-                        val._parents[state] = key
+                        val._attach_root(state, key)
 
         event.listen(
             parent_cls,
@@ -590,6 +641,13 @@ class MutableBase:
         )
 
         event.listen(parent_cls, "load", load, raw=True, propagate=True)
+        event.listen(
+            parent_cls,
+            "before_expire",
+            before_expire,
+            raw=True,
+            propagate=True,
+        )
         event.listen(
             parent_cls, "refresh", load_attrs, raw=True, propagate=True
         )
@@ -1079,3 +1137,576 @@ class MutableSet(Mutable, Set[_T]):
         self, proto: SupportsIndex
     ) -> Tuple[type, Tuple[List[int]]]:
         return (self.__class__, (list(self),))
+
+
+class _MutableJSONValue(Mutable):
+    @memoized_property
+    def _json_edges(
+        self,
+    ) -> Dict[int, Tuple[Any, int]]:
+        return {}
+
+    @memoized_property
+    def _json_roots(self) -> WeakKeyDictionary[InstanceState[Any], Set[str]]:
+        return weakref.WeakKeyDictionary()
+
+    def _iter_json_children(self) -> Iterable[_MutableJSONValue]:
+        raise NotImplementedError
+
+    def _attach_root(self, state: InstanceState[Any], key: str) -> None:
+        roots = self._json_roots.setdefault(state, set())
+        if not roots:
+            seen: Set[int] = set()
+            queued: Set[int] = {id(self)}
+            pending = deque([self])
+            while pending:
+                current = pending.popleft()
+                child_edges = {}
+                for child in current._iter_json_children():
+                    child_id = id(child)
+                    if child_id not in child_edges:
+                        child_edges[child_id] = [
+                            child,
+                            child._json_edges.get(id(current)),
+                            0,
+                        ]
+                    child_edges[child_id][2] += 1
+                for child, edge, multiplicity in child_edges.values():
+                    edges = child._json_edges
+                    if edge is None:
+                        edges[id(current)] = (
+                            finalize(
+                                current,
+                                child._json_edges.pop,
+                                id(current),
+                                None,
+                            ),
+                            multiplicity,
+                        )
+                    else:
+                        edges[id(current)] = (
+                            edge[0],
+                            edge[1] + multiplicity,
+                        )
+                for child, _, _ in child_edges.values():
+                    child_id = id(child)
+                    if child_id not in seen and child_id not in queued:
+                        queued.add(child_id)
+                        pending.append(child)
+                seen.add(id(current))
+                queued.discard(id(current))
+        self._parents[state] = key
+        roots.add(key)
+
+    def _detach_root(self, state: InstanceState[Any], key: str) -> None:
+        roots = self._json_roots.get(state)
+        if roots is None:
+            return
+        roots.discard(key)
+        if roots:
+            self._parents[state] = next(iter(roots))
+            return
+        self._parents.pop(state, None)
+        del self._json_roots[state]
+
+        seen: Set[int] = set()
+        queued: Set[int] = {id(self)}
+        pending = deque([self])
+        while pending:
+            current = pending.popleft()
+            child_edges = {}
+            for child in current._iter_json_children():
+                child_id = id(child)
+                if child_id not in child_edges:
+                    child_edges[child_id] = [
+                        child,
+                        child._json_edges.get(id(current)),
+                        0,
+                    ]
+                child_edges[child_id][2] += 1
+            for child, edge, multiplicity in child_edges.values():
+                if edge is None:
+                    continue
+                count = edge[1] - multiplicity
+                if count:
+                    child._json_edges[id(current)] = (edge[0], count)
+                else:
+                    edge[0].detach()
+                    del child._json_edges[id(current)]
+            for child, _, _ in child_edges.values():
+                child_id = id(child)
+                if child_id not in seen and child_id not in queued:
+                    queued.add(child_id)
+                    pending.append(child)
+            seen.add(id(current))
+            queued.discard(id(current))
+
+    def _attach_container(self, parent: "_MutableJSONValue") -> None:
+        edges = self._json_edges
+        edge = edges.get(id(parent))
+        if edge is None:
+            edges[id(parent)] = (
+                finalize(
+                    parent,
+                    self._json_edges.pop,
+                    id(parent),
+                    None,
+                ),
+                1,
+            )
+        else:
+            edges[id(parent)] = (edge[0], edge[1] + 1)
+
+    def _detach_container(self, parent: "_MutableJSONValue") -> None:
+        edge = self._json_edges.get(id(parent))
+        if edge is None:
+            return
+        count = edge[1] - 1
+        if count:
+            self._json_edges[id(parent)] = (edge[0], count)
+        else:
+            edge[0].detach()
+            del self._json_edges[id(parent)]
+
+    def _rejects_json_cycle(self, value: Any) -> bool:
+        if not isinstance(value, (dict, list, tuple)):
+            return False
+        seen: Set[int] = set()
+        active: Set[int] = set()
+        pending = [(value, False)]
+        while pending:
+            current, exiting = pending.pop()
+            current_id = id(current)
+            if exiting:
+                active.discard(current_id)
+                seen.add(current_id)
+                continue
+            if current_id in active:
+                return True
+            if current_id in seen:
+                continue
+            active.add(current_id)
+            if current is self:
+                return True
+            pending.append((current, True))
+            if isinstance(current, _MutableJSONValue):
+                children = current._iter_json_children()
+            elif isinstance(current, dict):
+                children = current.values()
+            else:
+                children = current
+            for child in children:
+                if isinstance(child, (dict, list, tuple)):
+                    pending.append((child, False))
+        return False
+
+    def _coerce_json_child(self, value: Any) -> Any:
+        if isinstance(value, (dict, list, tuple)):
+            if self._rejects_json_cycle(value):
+                raise ValueError(
+                    "JSON values cannot contain cyclic references"
+                )
+            return _coerce_mutable_json_value("JSON", value, {})
+        return value
+
+    def _coerce_or_keep_json_child(self, value: Any) -> Any:
+        if isinstance(value, _MutableJSONValue):
+            if self._rejects_json_cycle(value):
+                raise ValueError(
+                    "JSON values cannot contain cyclic references"
+                )
+            return value
+        return self._coerce_json_child(value)
+
+    def _attach_json_child(self, value: Any) -> None:
+        if isinstance(value, _MutableJSONValue):
+            value._attach_container(self)
+
+    def _detach_json_child(self, value: Any) -> None:
+        if isinstance(value, _MutableJSONValue):
+            value._detach_container(self)
+
+    def changed(self) -> None:
+        seen: Set[int] = set()
+        pending: deque[_MutableJSONValue] = deque([self])
+        while pending:
+            current = pending.popleft()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+
+            active = False
+            for parent, key in current._parents.items():
+                obj = parent.obj()
+                if obj is not None:
+                    flag_modified(obj, key)
+                    active = True
+
+            for edge_finalize, _ in current._json_edges.values():
+                parent = edge_finalize.peek()[0]
+                if parent is not None:
+                    pending.append(parent)
+                    active = True
+
+    @staticmethod
+    def _coerce_value(key: str, value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            _validate_mutable_json_value(key, value, set())
+        return _coerce_mutable_json_value(key, value, {})
+
+
+def _validate_mutable_json_value(
+    key: str,
+    value: Any,
+    seen: Set[int],
+) -> None:
+    if (
+        not isinstance(value, (dict, list, tuple))
+        or id(value) in seen
+    ):
+        return
+
+    active: Set[int] = set()
+    pending = [(value, False)]
+    while pending:
+        current, exiting = pending.pop()
+        current_id = id(current)
+        if exiting:
+            active.discard(current_id)
+            seen.add(current_id)
+            continue
+        if current_id in seen:
+            continue
+        if current_id in active:
+            raise ValueError(
+                "Attribute '%s' does not accept cyclic JSON values" % key
+            )
+        active.add(current_id)
+        pending.append((current, True))
+        children = current.values() if isinstance(current, dict) else current
+        child_containers = [
+            child
+            for child in children
+            if isinstance(child, (dict, list, tuple))
+        ]
+        for child in child_containers:
+            if id(child) in active:
+                raise ValueError(
+                    "Attribute '%s' does not accept cyclic JSON values" % key
+                )
+            if id(child) not in seen:
+                pending.append((child, False))
+
+
+def _json_coercion_cache() -> Dict[int, _MutableJSONValue]:
+    if len(_JSON_COERCION_CACHE) > 4096:
+        _JSON_COERCION_CACHE.clear()
+    return _JSON_COERCION_CACHE
+
+
+_JSON_COERCION_CACHE: Dict[int, _MutableJSONValue] = {}
+
+
+def _coerce_mutable_json_value(
+    key: str,
+    value: Any,
+    converted: Dict[int, _MutableJSONValue],
+) -> Any:
+    cached = _json_coercion_cache().get(id(value))
+    if cached is not None:
+        return cached
+    if isinstance(value, _MutableJSONValue):
+        existing = converted.get(id(value))
+        if existing is not None:
+            return existing
+        converted[id(value)] = value
+        if isinstance(value, MutableJSONDict):
+            for child_key, child_value in tuple(dict.items(value)):
+                dict.__setitem__(
+                    value,
+                    child_key,
+                    _coerce_mutable_json_value(key, child_value, converted),
+                )
+        else:
+            for index, child_value in enumerate(list(value)):
+                list.__setitem__(
+                    value,
+                    index,
+                    _coerce_mutable_json_value(key, child_value, converted),
+                )
+        return value
+
+    existing = converted.get(id(value))
+    if existing is not None:
+        return existing
+
+    if isinstance(value, dict):
+        result: _MutableJSONValue = MutableJSONDict()
+        converted[id(value)] = result
+        _json_coercion_cache()[id(value)] = result
+        for child_key, child_value in value.items():
+            dict.__setitem__(
+                result,
+                child_key,
+                _coerce_mutable_json_value(key, child_value, converted),
+            )
+        return result
+
+    if isinstance(value, list):
+        result = MutableJSONList()
+        converted[id(value)] = result
+        _json_coercion_cache()[id(value)] = result
+        for child_value in value:
+            list.append(
+                result,
+                _coerce_mutable_json_value(key, child_value, converted),
+            )
+        return result
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    return Mutable.coerce(key, value)
+
+
+class MutableJSONDict(_MutableJSONValue, MutableDict):
+    """A JSON object that tracks nested object and array mutations."""
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "MutableJSONDict":
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        result = self.__class__()
+        memo[id(self)] = result
+        for key, value in dict.items(self):
+            dict.__setitem__(
+                result,
+                copy.deepcopy(key, memo),
+                self._coerce_json_child(copy.deepcopy(value, memo)),
+            )
+        return result
+
+    def _iter_json_children(self) -> Iterable[_MutableJSONValue]:
+        for value in dict.values(self):
+            if isinstance(value, _MutableJSONValue):
+                yield value
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        old = dict.get(self, key)
+        value = self._coerce_or_keep_json_child(value)
+        self._attach_json_child(value)
+        dict.__setitem__(self, key, value)
+        self._detach_json_child(old)
+        self.changed()
+
+    def __delitem__(self, key: Any) -> None:
+        old = dict.__getitem__(self, key)
+        dict.__delitem__(self, key)
+        self._detach_json_child(old)
+        self.changed()
+
+    def setdefault(self, *arg: Any) -> Any:
+        key = arg[0]
+        if key in self:
+            return dict.get(self, key)
+        value = self._coerce_or_keep_json_child(
+            arg[1] if len(arg) > 1 else None
+        )
+        self._attach_json_child(value)
+        dict.__setitem__(self, key, value)
+        self.changed()
+        return value
+
+    def update(self, *arg: Any, **kw: Any) -> None:
+        if arg:
+            if len(arg) > 1:
+                raise TypeError(
+                    "update expected at most 1 argument, got %d" % len(arg)
+                )
+            source = arg[0]
+            if hasattr(source, "keys"):
+                items = [
+                    (child_key, source[child_key])
+                    for child_key in source.keys()
+                ]
+            else:
+                items = list(source)
+        else:
+            items = []
+        items.extend(kw.items())
+        coerced = [
+            (child_key, self._coerce_or_keep_json_child(child_value))
+            for child_key, child_value in items
+        ]
+        old_values = [dict.get(self, child_key) for child_key, _ in coerced]
+        for _, child_value in coerced:
+            self._attach_json_child(child_value)
+        new_value = {key: value for key, value in coerced}
+        dict.update(self, new_value)
+        for old in old_values:
+            self._detach_json_child(old)
+        self.changed()
+
+    def pop(self, *arg: Any) -> Any:
+        key = arg[0]
+        if key in self:
+            old = dict.__getitem__(self, key)
+            result = dict.pop(self, key)
+            self._detach_json_child(old)
+            self.changed()
+            return result
+        if len(arg) > 1:
+            return arg[1]
+        raise KeyError(key)
+
+    def popitem(self) -> Tuple[Any, Any]:
+        key, old = dict.popitem(self)
+        self._detach_json_child(old)
+        self.changed()
+        return key, old
+
+    def clear(self) -> None:
+        old_values = list(dict.values(self))
+        dict.clear(self)
+        for old in old_values:
+            self._detach_json_child(old)
+        self.changed()
+
+    @classmethod
+    def coerce(cls, key: str, value: Any) -> Optional["MutableJSONDict"]:
+        if value is None:
+            return None
+        result = _MutableJSONValue._coerce_value(key, value)
+        if isinstance(result, MutableJSONDict):
+            return result
+        return Mutable.coerce(key, value)
+
+
+class MutableJSONList(_MutableJSONValue, MutableList):
+    """A JSON array that tracks nested object and array mutations."""
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "MutableJSONList":
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        result = self.__class__()
+        memo[id(self)] = result
+        for value in list.__iter__(self):
+            list.append(
+                result,
+                self._coerce_json_child(copy.deepcopy(value, memo)),
+            )
+        return result
+
+    def _iter_json_children(self) -> Iterable[_MutableJSONValue]:
+        for value in list.__iter__(self):
+            if isinstance(value, _MutableJSONValue):
+                yield value
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        if isinstance(index, slice):
+            old_values = list.__getitem__(self, index)
+            coerced = [
+                self._coerce_or_keep_json_child(item)
+                for item in value
+            ]
+            for item in coerced:
+                self._attach_json_child(item)
+            list.__setitem__(self, index, coerced)
+            for old in old_values:
+                self._detach_json_child(old)
+        else:
+            old = list.__getitem__(self, index)
+            value = self._coerce_or_keep_json_child(value)
+            self._attach_json_child(value)
+            list.__setitem__(self, index, value)
+            self._detach_json_child(old)
+        self.changed()
+
+    def __delitem__(self, index: Any) -> None:
+        old_values = (
+            list.__getitem__(self, index)
+            if isinstance(index, slice)
+            else [list.__getitem__(self, index)]
+        )
+        list.__delitem__(self, index)
+        for old in old_values:
+            self._detach_json_child(old)
+        self.changed()
+
+    def pop(self, *arg: Any) -> Any:
+        result = list.pop(self, *arg)
+        self._detach_json_child(result)
+        self.changed()
+        return result
+
+    def append(self, value: Any) -> None:
+        value = self._coerce_or_keep_json_child(value)
+        self._attach_json_child(value)
+        list.append(self, value)
+        self.changed()
+
+    def extend(self, values: Iterable[Any]) -> None:
+        coerced = [
+            self._coerce_or_keep_json_child(value)
+            for value in values
+        ]
+        for value in coerced:
+            self._attach_json_child(value)
+        list.extend(self, coerced)
+        self.changed()
+
+    def insert(self, index: SupportsIndex, value: Any) -> None:
+        value = self._coerce_or_keep_json_child(value)
+        self._attach_json_child(value)
+        list.insert(self, index, value)
+        self.changed()
+
+    def remove(self, value: Any) -> None:
+        index = list.index(self, value)
+        old = list.__getitem__(self, index)
+        list.remove(self, value)
+        self._detach_json_child(old)
+        self.changed()
+
+    def clear(self) -> None:
+        old_values = list(self)
+        list.clear(self)
+        for old in old_values:
+            self._detach_json_child(old)
+        self.changed()
+
+    @classmethod
+    def coerce(cls, key: str, value: Any) -> Optional["MutableJSONList"]:
+        if value is None:
+            return None
+        result = _MutableJSONValue._coerce_value(key, value)
+        if isinstance(result, MutableJSONList):
+            return result
+        return Mutable.coerce(key, value)
+
+
+class MutableJSON(_MutableJSONValue):
+    """Mutable root for a JSON object or array.
+
+    Use with :meth:`.Mutable.as_mutable` when the column root may be either a
+    dict or list.  Plain nested containers are coerced recursively while
+    cyclic structures are rejected.
+    """
+
+    def __new__(cls) -> NoReturn:  # type: ignore[override]
+        if cls is not MutableJSON:
+            return super().__new__(cls)
+        raise ValueError(
+            "MutableJSON root must be a dictionary or a list; use "
+            "MutableJSONDict or MutableJSONList to instantiate a container"
+        )
+
+    @classmethod
+    def coerce(cls, key: str, value: Any) -> Optional[_MutableJSONValue]:
+        if value is None:
+            return None
+        result = _MutableJSONValue._coerce_value(key, value)
+        if isinstance(result, _MutableJSONValue):
+            return result
+        return Mutable.coerce(key, value)
