@@ -898,7 +898,11 @@ class _BulkUDCompileState(_ORMDMLState):
                 for ae in global_attributes[
                     ("additional_entity_criteria", ext_info.mapper)
                 ]
-                if ae.include_aliases or ae.entity is ext_info
+                if (
+                    ae.include_aliases
+                    or ae.entity is ext_info
+                    or (ae.entity is None and not ext_info.is_aliased_class)
+                )
             )
 
         if ext_info.mapper._single_table_criterion is not None:

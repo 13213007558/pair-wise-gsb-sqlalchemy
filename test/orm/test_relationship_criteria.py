@@ -2110,6 +2110,59 @@ class LoaderCriteriaTest(_Fixtures, testing.AssertsCompiledSQL):
 
             eq_(s.execute(stmt).scalars().all(), [UserWFoob(name=name)])
 
+    def test_mixin_base_applies_w_default_include_aliases(self, mixin_fixture):
+        """unmapped base class criteria must apply to mapped subclasses
+        without requiring include_aliases=True."""
+        HasFoob, UserWFoob = mixin_fixture
+
+        stmt = select(UserWFoob).options(
+            with_loader_criteria(HasFoob, lambda cls: cls.name != "name")
+        )
+
+        self.assert_compile(
+            stmt,
+            "SELECT users.id, users.name FROM users "
+            "WHERE users.name != :name_1",
+        )
+
+    def test_mixin_base_still_skips_aliased_by_default(self, mixin_fixture):
+        """unmapped base class criteria must not apply to aliased()
+        entities unless include_aliases=True."""
+        HasFoob, UserWFoob = mixin_fixture
+
+        ua = aliased(UserWFoob)
+        stmt = select(ua).options(
+            with_loader_criteria(HasFoob, lambda cls: cls.name != "name")
+        )
+
+        self.assert_compile(
+            stmt,
+            "SELECT users_1.id, users_1.name FROM users AS users_1",
+        )
+
+    @testing.variation("dml", ["update", "delete"])
+    def test_mixin_base_applies_to_orm_dml(self, mixin_fixture, dml):
+        """unmapped base class criteria must apply to ORM UPDATE/DELETE
+        without requiring include_aliases=True."""
+        HasFoob, UserWFoob = mixin_fixture
+
+        if dml.update:
+            stmt = update(UserWFoob).values(name="newname")
+            expected = (
+                "UPDATE users SET name=:name WHERE users.name != :name_1"
+            )
+        elif dml.delete:
+            stmt = delete(UserWFoob)
+            expected = "DELETE FROM users WHERE users.name != :name_1"
+        else:
+            dml.fail()
+
+        stmt = stmt.options(
+            with_loader_criteria(HasFoob, lambda cls: cls.name != "name")
+        )
+
+        self.assert_compile(stmt, expected)
+
     def test_unnamed_param_dont_fail(self, multi_mixin_fixture):
         HasFoob, Order, Item = multi_mixin_fixture
 
